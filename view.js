@@ -409,6 +409,10 @@ export class View extends HTMLElement {
                 this.#emit('show-annotation', { value, index, range })
             }
         }, false)
+        doc.addEventListener('mousemove', e => {
+            const [value] = overlayer.hitTest(e)
+            doc.body.style.cursor = value ? 'pointer' : ''
+        }, false)
 
         const list = this.#searchResults.get(index)
         if (list) for (const item of list) this.addAnnotation(item)
