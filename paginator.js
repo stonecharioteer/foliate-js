@@ -1098,6 +1098,9 @@ export class Paginator extends HTMLElement {
         }]
         return []
     }
+    getVisibleRange() {
+        return this.#getVisibleRange()
+    }
     setStyles(styles) {
         this.#styles = styles
         const $$styles = this.#styleMap.get(this.#view?.document)
