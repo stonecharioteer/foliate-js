@@ -130,6 +130,8 @@ export class Overlayer {
         g.style.opacity = 'var(--overlayer-highlight-opacity, .3)'
         g.style.mixBlendMode = 'var(--overlayer-highlight-blend-mode, normal)'
         for (const { left, top, height, width } of rects) {
+            // skip degenerate rects from <br> or block boundaries
+            if (height < 2 || width < 2) continue
             const el = createSVGElement('rect')
             el.setAttribute('x', left)
             el.setAttribute('y', top)
