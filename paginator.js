@@ -959,8 +959,9 @@ export class Paginator extends HTMLElement {
         const heldMs = e.timeStamp - state.startTime
         const driftX = Math.abs(touch.screenX - state.startX)
         const driftY = Math.abs(touch.screenY - state.startY)
-        if (heldMs >= TOUCH_SELECTION_HOLD_MS
-            && driftX <= TOUCH_SELECTION_DRIFT_PX
+        // Within the hold detection window and drift is small — wait to see
+        // if this becomes a long-press selection or a deliberate swipe.
+        if (driftX <= TOUCH_SELECTION_DRIFT_PX
             && driftY <= TOUCH_SELECTION_DRIFT_PX) return
 
         e.preventDefault()
@@ -982,7 +983,15 @@ export class Paginator extends HTMLElement {
         if (!touchScrolled) return
         if (this.scrolled) return
         if (!this.#touchState) return
-        if (hasRangeSelection(e.target)) return
+
+        // If the user selected text but the page partially scrolled during
+        // the gesture, snap back to a clean position without flinging.
+        if (hasRangeSelection(e.target)) {
+            requestAnimationFrame(() => {
+                if (getViewportScale() === 1) this.snap(0, 0)
+            })
+            return
+        }
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
