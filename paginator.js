@@ -1,5 +1,28 @@
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+const ResizeObserverImpl = globalThis.ResizeObserver
+    ?? class {
+        constructor() {}
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+    }
+
+const createMediaQueryList = query => {
+    if (typeof globalThis.matchMedia === 'function') return globalThis.matchMedia(query)
+    return {
+        matches: false,
+        media: query,
+        addEventListener() {},
+        removeEventListener() {},
+        addListener() {},
+        removeListener() {},
+        onchange: null,
+    }
+}
+
+const getViewportScale = () => globalThis.visualViewport?.scale ?? 1
+
 const debounce = (f, wait, immediate) => {
     let timeout
     return (...args) => {
@@ -194,6 +217,26 @@ const getBackground = doc => {
         : bodyStyle.background
 }
 
+const getTargetElement = target =>
+    target?.nodeType === Node.ELEMENT_NODE ? target : target?.parentElement ?? null
+
+const hasRangeSelection = target => {
+    const doc = target?.ownerDocument
+    const sel = doc?.getSelection?.()
+    return !!sel && !sel.isCollapsed && sel.rangeCount > 0 && sel.type === 'Range'
+}
+
+const isEditableTarget = target => {
+    const el = getTargetElement(target)
+    if (!el?.closest) return false
+    return !!el.closest(
+        'input, textarea, select, [contenteditable], [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]',
+    )
+}
+
+const TOUCH_SELECTION_HOLD_MS = 280
+const TOUCH_SELECTION_DRIFT_PX = 12
+
 const makeMarginals = (length, part) => Array.from({ length }, () => {
     const div = document.createElement('div')
     const child = document.createElement('div')
@@ -208,7 +251,7 @@ const setStylesImportant = (el, styles) => {
 }
 
 class View {
-    #observer = new ResizeObserver(() => this.expand())
+    #observer = new ResizeObserverImpl(() => this.expand())
     #element = document.createElement('div')
     #iframe = document.createElement('iframe')
     #contentRange = document.createRange()
@@ -428,7 +471,7 @@ export class Paginator extends HTMLElement {
         'max-inline-size', 'max-block-size', 'max-column-count',
     ]
     #root = this.attachShadow({ mode: 'closed' })
-    #observer = new ResizeObserver(() => this.render())
+    #observer = new ResizeObserverImpl(() => this.render())
     #top
     #background
     #container
@@ -444,7 +487,7 @@ export class Paginator extends HTMLElement {
     #locked = false // while true, prevent any further navigation
     #styles
     #styleMap = new WeakMap()
-    #mediaQuery = matchMedia('(prefers-color-scheme: dark)')
+    #mediaQuery = createMediaQueryList('(prefers-color-scheme: dark)')
     #mediaQueryListener
     #scrollBounds
     #touchState
@@ -825,21 +868,36 @@ export class Paginator extends HTMLElement {
         const touch = e.changedTouches[0]
         this.#touchState = {
             x: touch?.screenX, y: touch?.screenY,
+            startX: touch?.screenX, startY: touch?.screenY,
             t: e.timeStamp,
-            vx: 0, xy: 0,
+            startTime: e.timeStamp,
+            vx: 0, vy: 0,
         }
     }
     #onTouchMove(e) {
         const state = this.#touchState
+        if (!state) return
         if (state.pinched) return
-        state.pinched = globalThis.visualViewport.scale > 1
+        state.pinched = getViewportScale() > 1
         if (this.scrolled || state.pinched) return
         if (e.touches.length > 1) {
             if (this.#touchScrolled) e.preventDefault()
             return
         }
-        e.preventDefault()
         const touch = e.changedTouches[0]
+        if (!touch) return
+
+        // Preserve native long-press selection and handle drags.
+        if (hasRangeSelection(e.target) || isEditableTarget(e.target)) return
+
+        const heldMs = e.timeStamp - state.startTime
+        const driftX = Math.abs(touch.screenX - state.startX)
+        const driftY = Math.abs(touch.screenY - state.startY)
+        if (heldMs >= TOUCH_SELECTION_HOLD_MS
+            && driftX <= TOUCH_SELECTION_DRIFT_PX
+            && driftY <= TOUCH_SELECTION_DRIFT_PX) return
+
+        e.preventDefault()
         const x = touch.screenX, y = touch.screenY
         const dx = state.x - x, dy = state.y - y
         const dt = e.timeStamp - state.t
@@ -851,15 +909,19 @@ export class Paginator extends HTMLElement {
         this.#touchScrolled = true
         this.scrollBy(dx, dy)
     }
-    #onTouchEnd() {
+    #onTouchEnd(e) {
+        const touchScrolled = this.#touchScrolled
         this.#touchScrolled = false
+        if (!touchScrolled) return
         if (this.scrolled) return
+        if (!this.#touchState) return
+        if (hasRangeSelection(e.target)) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
         requestAnimationFrame(() => {
-            if (globalThis.visualViewport.scale === 1)
+            if (getViewportScale() === 1)
                 this.snap(this.#touchState.vx, this.#touchState.vy)
         })
     }
