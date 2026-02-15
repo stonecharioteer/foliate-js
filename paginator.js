@@ -235,7 +235,7 @@ const isEditableTarget = target => {
 }
 
 const TOUCH_SELECTION_HOLD_MS = 280
-const TOUCH_SELECTION_DRIFT_PX = 12
+const TOUCH_SELECTION_DRIFT_PX = 30
 const TOUCH_SELECTION_CORNER_HOLD_MS = 420
 const TOUCH_SELECTION_CORNER_COOLDOWN_MS = 520
 const TOUCH_SELECTION_CORNER_MIN_PX = 40
@@ -949,7 +949,7 @@ export class Paginator extends HTMLElement {
         if (!touch) return
 
         // Preserve native long-press selection and handle drags.
-        if (hasRangeSelection(e.target)) {
+        if (this.#hasActiveSelection()) {
             this.#maybeTurnTouchSelectionPage(touch, e.timeStamp)
             return
         }
@@ -976,7 +976,21 @@ export class Paginator extends HTMLElement {
         this.#touchScrolled = true
         this.scrollBy(dx, dy)
     }
-    #onTouchEnd(e) {
+    #hasActiveSelection() {
+        // Check both the outer document and the iframe document for
+        // an active range selection, since touchend target may be in either.
+        if (hasRangeSelection(this)) return true
+        try {
+            const doc = this.#view?.document
+            if (doc) {
+                const sel = doc.getSelection?.()
+                if (sel && !sel.isCollapsed && sel.rangeCount > 0
+                    && sel.type === 'Range') return true
+            }
+        } catch { /* cross-origin iframe — ignore */ }
+        return false
+    }
+    #onTouchEnd() {
         this.#resetTouchSelectionCornerHold()
         const touchScrolled = this.#touchScrolled
         this.#touchScrolled = false
@@ -984,21 +998,19 @@ export class Paginator extends HTMLElement {
         if (this.scrolled) return
         if (!this.#touchState) return
 
-        // If the user selected text but the page partially scrolled during
-        // the gesture, snap back to a clean position without flinging.
-        if (hasRangeSelection(e.target)) {
-            requestAnimationFrame(() => {
-                if (getViewportScale() === 1) this.snap(0, 0)
-            })
-            return
-        }
+        // If text is selected, snap back to nearest page without flinging
+        // so the page never gets stuck half-turned.
+        const selecting = this.#hasActiveSelection()
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
         requestAnimationFrame(() => {
             if (getViewportScale() === 1)
-                this.snap(this.#touchState.vx, this.#touchState.vy)
+                this.snap(
+                    selecting ? 0 : this.#touchState.vx,
+                    selecting ? 0 : this.#touchState.vy,
+                )
         })
     }
     // allows one to process rects as if they were LTR and horizontal
