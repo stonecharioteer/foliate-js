@@ -236,6 +236,10 @@ const isEditableTarget = target => {
 
 const TOUCH_SELECTION_HOLD_MS = 280
 const TOUCH_SELECTION_DRIFT_PX = 12
+const TOUCH_SELECTION_CORNER_HOLD_MS = 420
+const TOUCH_SELECTION_CORNER_COOLDOWN_MS = 520
+const TOUCH_SELECTION_CORNER_MIN_PX = 40
+const TOUCH_SELECTION_CORNER_MAX_PX = 88
 
 const makeMarginals = (length, part) => Array.from({ length }, () => {
     const div = document.createElement('div')
@@ -612,10 +616,12 @@ export class Paginator extends HTMLElement {
         this.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
         this.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
         this.addEventListener('touchend', this.#onTouchEnd.bind(this))
+        this.addEventListener('touchcancel', this.#onTouchEnd.bind(this))
         this.addEventListener('load', ({ detail: { doc } }) => {
             doc.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
             doc.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
             doc.addEventListener('touchend', this.#onTouchEnd.bind(this))
+            doc.addEventListener('touchcancel', this.#onTouchEnd.bind(this))
         })
 
         this.addEventListener('relocate', ({ detail }) => {
@@ -638,8 +644,12 @@ export class Paginator extends HTMLElement {
         }, 700)
         this.addEventListener('load', ({ detail: { doc } }) => {
             let isPointerSelecting = false
-            doc.addEventListener('pointerdown', () => isPointerSelecting = true)
+            doc.addEventListener('pointerdown', e =>
+                // Touch/pen selection should never trigger auto page-turn while selecting.
+                // Keep cross-page drag selection behavior for mouse only.
+                isPointerSelecting = (e.pointerType || 'mouse') === 'mouse')
             doc.addEventListener('pointerup', () => isPointerSelecting = false)
+            doc.addEventListener('pointercancel', () => isPointerSelecting = false)
             let isKeyboardSelecting = false
             doc.addEventListener('keydown', () => isKeyboardSelecting = true)
             doc.addEventListener('keyup', () => isKeyboardSelecting = false)
@@ -872,7 +882,58 @@ export class Paginator extends HTMLElement {
             t: e.timeStamp,
             startTime: e.timeStamp,
             vx: 0, vy: 0,
+            cornerDir: 0,
+            cornerSince: 0,
+            cornerTurnAt: 0,
         }
+    }
+    #resetTouchSelectionCornerHold() {
+        if (!this.#touchState) return
+        this.#touchState.cornerDir = 0
+        this.#touchState.cornerSince = 0
+    }
+    #getTouchSelectionCornerDirection(touch) {
+        const rect = this.#container.getBoundingClientRect()
+        const cornerSize = Math.max(
+            TOUCH_SELECTION_CORNER_MIN_PX,
+            Math.min(
+                TOUCH_SELECTION_CORNER_MAX_PX,
+                Math.round(Math.min(rect.width, rect.height) * 0.14),
+            ),
+        )
+        const inTopLeft =
+            touch.clientX <= rect.left + cornerSize
+            && touch.clientY <= rect.top + cornerSize
+        const inBottomRight =
+            touch.clientX >= rect.right - cornerSize
+            && touch.clientY >= rect.bottom - cornerSize
+        if (inTopLeft) return -1
+        if (inBottomRight) return 1
+        return 0
+    }
+    #maybeTurnTouchSelectionPage(touch, timeStamp) {
+        const state = this.#touchState
+        if (!state || this.#locked) return
+        const dir = this.#getTouchSelectionCornerDirection(touch)
+        if (!dir) {
+            this.#resetTouchSelectionCornerHold()
+            return
+        }
+
+        if (state.cornerDir !== dir) {
+            state.cornerDir = dir
+            state.cornerSince = timeStamp
+            return
+        }
+
+        const heldFor = timeStamp - (state.cornerSince ?? timeStamp)
+        if (heldFor < TOUCH_SELECTION_CORNER_HOLD_MS) return
+        if (timeStamp - (state.cornerTurnAt ?? 0) < TOUCH_SELECTION_CORNER_COOLDOWN_MS) return
+
+        state.cornerTurnAt = timeStamp
+        state.cornerSince = timeStamp
+        if (dir < 0) this.prev()
+        else this.next()
     }
     #onTouchMove(e) {
         const state = this.#touchState
@@ -888,7 +949,12 @@ export class Paginator extends HTMLElement {
         if (!touch) return
 
         // Preserve native long-press selection and handle drags.
-        if (hasRangeSelection(e.target) || isEditableTarget(e.target)) return
+        if (hasRangeSelection(e.target)) {
+            this.#maybeTurnTouchSelectionPage(touch, e.timeStamp)
+            return
+        }
+        this.#resetTouchSelectionCornerHold()
+        if (isEditableTarget(e.target)) return
 
         const heldMs = e.timeStamp - state.startTime
         const driftX = Math.abs(touch.screenX - state.startX)
@@ -910,6 +976,7 @@ export class Paginator extends HTMLElement {
         this.scrollBy(dx, dy)
     }
     #onTouchEnd(e) {
+        this.#resetTouchSelectionCornerHold()
         const touchScrolled = this.#touchScrolled
         this.#touchScrolled = false
         if (!touchScrolled) return
