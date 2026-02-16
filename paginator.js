@@ -240,6 +240,11 @@ const TOUCH_SELECTION_CORNER_HOLD_MS = 420
 const TOUCH_SELECTION_CORNER_COOLDOWN_MS = 520
 const TOUCH_SELECTION_CORNER_MIN_PX = 40
 const TOUCH_SELECTION_CORNER_MAX_PX = 88
+const TOUCH_STATE_IDLE = 'IDLE'
+const TOUCH_PENDING = 'TOUCH_PENDING'
+const TOUCH_SWIPE = 'TOUCH_SWIPE'
+const SELECTION_PRIMED = 'SELECTION_PRIMED'
+const SELECTION_ACTIVE = 'SELECTION_ACTIVE'
 
 const makeMarginals = (length, part) => Array.from({ length }, () => {
     const div = document.createElement('div')
@@ -495,6 +500,7 @@ export class Paginator extends HTMLElement {
     #mediaQueryListener
     #scrollBounds
     #touchState
+    #touchHoldTimer
     #touchScrolled
     #lastVisibleRange
     constructor() {
@@ -603,6 +609,10 @@ export class Paginator extends HTMLElement {
         this.#header = this.#root.getElementById('header')
         this.#footer = this.#root.getElementById('footer')
 
+        // Invariant: one touch sequence, one gesture owner.
+        // Do not set data-* attributes in the custom-element constructor:
+        // Chrome can throw during createElement if attributes are mutated here.
+
         this.#observer.observe(this.#container)
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
         this.#container.addEventListener('scroll', debounce(() => {
@@ -654,6 +664,7 @@ export class Paginator extends HTMLElement {
             doc.addEventListener('keydown', () => isKeyboardSelecting = true)
             doc.addEventListener('keyup', () => isKeyboardSelecting = false)
             doc.addEventListener('selectionchange', () => {
+                this.#syncTouchSelectionOwnership()
                 if (this.scrolled) return
                 const range = this.#lastVisibleRange
                 if (!range) return
@@ -874,7 +885,34 @@ export class Paginator extends HTMLElement {
             })
         })
     }
+    #clearTouchHoldTimer() {
+        if (this.#touchHoldTimer) {
+            clearTimeout(this.#touchHoldTimer)
+            this.#touchHoldTimer = null
+        }
+    }
+    #setTouchStateIdle() {
+        this.dataset.touchState = TOUCH_STATE_IDLE
+    }
+    #setTouchOwnership(owner) {
+        const state = this.#touchState
+        if (!state) return
+        if (state.owner === SELECTION_ACTIVE && owner !== SELECTION_ACTIVE) return
+        state.owner = owner
+        this.dataset.touchState = owner
+        if (owner === TOUCH_SWIPE || owner === SELECTION_ACTIVE) this.#clearTouchHoldTimer()
+    }
+    #syncTouchSelectionOwnership() {
+        const state = this.#touchState
+        if (!state) return false
+        const hasSelection = this.#hasActiveSelection()
+        if (!hasSelection) return false
+        // Selection must outrank swipe once an active range exists in this touch sequence.
+        if (state.owner !== SELECTION_ACTIVE) this.#setTouchOwnership(SELECTION_ACTIVE)
+        return state.owner === SELECTION_ACTIVE
+    }
     #onTouchStart(e) {
+        this.#clearTouchHoldTimer()
         const touch = e.changedTouches[0]
         this.#touchState = {
             x: touch?.screenX, y: touch?.screenY,
@@ -882,10 +920,18 @@ export class Paginator extends HTMLElement {
             t: e.timeStamp,
             startTime: e.timeStamp,
             vx: 0, vy: 0,
+            owner: TOUCH_PENDING,
             cornerDir: 0,
             cornerSince: 0,
             cornerTurnAt: 0,
         }
+        this.#touchScrolled = false
+        this.dataset.touchState = TOUCH_PENDING
+        this.#touchHoldTimer = setTimeout(() => {
+            const state = this.#touchState
+            if (!state || state.owner !== TOUCH_PENDING) return
+            this.#setTouchOwnership(SELECTION_PRIMED)
+        }, TOUCH_SELECTION_HOLD_MS)
     }
     #resetTouchSelectionCornerHold() {
         if (!this.#touchState) return
@@ -948,21 +994,37 @@ export class Paginator extends HTMLElement {
         const touch = e.changedTouches[0]
         if (!touch) return
 
-        // Preserve native long-press selection and handle drags.
-        if (this.#hasActiveSelection()) {
-            this.#maybeTurnTouchSelectionPage(touch, e.timeStamp)
+        const selecting = this.#syncTouchSelectionOwnership()
+        if (state.owner === SELECTION_ACTIVE) {
+            if (selecting) this.#maybeTurnTouchSelectionPage(touch, e.timeStamp)
+            else this.#resetTouchSelectionCornerHold()
             return
         }
+        if (state.owner === SELECTION_PRIMED) {
+            this.#resetTouchSelectionCornerHold()
+            return
+        }
+        if (selecting) {
+            this.#resetTouchSelectionCornerHold()
+            return
+        }
+
         this.#resetTouchSelectionCornerHold()
         if (isEditableTarget(e.target)) return
 
-        const heldMs = e.timeStamp - state.startTime
         const driftX = Math.abs(touch.screenX - state.startX)
         const driftY = Math.abs(touch.screenY - state.startY)
-        // Within the hold detection window and drift is small — wait to see
-        // if this becomes a long-press selection or a deliberate swipe.
+
+        // Don't scroll the paginator until the finger has moved enough to
+        // clearly indicate a swipe (~30px / ~5mm).  We intentionally do NOT
+        // call preventDefault() here so the browser's long-press text
+        // selection can initiate normally.  The reader layout uses
+        // overflow:hidden to prevent body scrolling during this window.
         if (driftX <= TOUCH_SELECTION_DRIFT_PX
             && driftY <= TOUCH_SELECTION_DRIFT_PX) return
+
+        if (state.owner === TOUCH_PENDING) this.#setTouchOwnership(TOUCH_SWIPE)
+        if (state.owner !== TOUCH_SWIPE) return
 
         e.preventDefault()
         const x = touch.screenX, y = touch.screenY
@@ -991,26 +1053,32 @@ export class Paginator extends HTMLElement {
         return false
     }
     #onTouchEnd() {
+        const state = this.#touchState
+        this.#clearTouchHoldTimer()
         this.#resetTouchSelectionCornerHold()
-        const touchScrolled = this.#touchScrolled
         this.#touchScrolled = false
-        if (!touchScrolled) return
+        if (!state) {
+            this.#setTouchStateIdle()
+            return
+        }
+        if ((state.owner === TOUCH_PENDING || state.owner === SELECTION_PRIMED)
+            && this.#hasActiveSelection()) this.#setTouchOwnership(SELECTION_ACTIVE)
+        const owner = state.owner
+        const vx = state.vx
+        const vy = state.vy
+        this.#touchState = null
+        this.#setTouchStateIdle()
         if (this.scrolled) return
-        if (!this.#touchState) return
-
-        // If text is selected, snap back to nearest page without flinging
-        // so the page never gets stuck half-turned.
-        const selecting = this.#hasActiveSelection()
+        if (owner === SELECTION_ACTIVE) return
+        if (owner === SELECTION_PRIMED) return
+        if (owner !== TOUCH_SWIPE) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
         requestAnimationFrame(() => {
             if (getViewportScale() === 1)
-                this.snap(
-                    selecting ? 0 : this.#touchState.vx,
-                    selecting ? 0 : this.#touchState.vy,
-                )
+                this.snap(vx, vy)
         })
     }
     // allows one to process rects as if they were LTR and horizontal
@@ -1101,6 +1169,7 @@ export class Paginator extends HTMLElement {
             this.start - size, this.end - size, this.#getRectMapper())
     }
     #afterScroll(reason) {
+        this.dataset.lastRelocateReason = reason ?? ''
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
