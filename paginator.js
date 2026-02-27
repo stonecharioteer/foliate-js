@@ -391,7 +391,7 @@ class View {
         this.expand()
     }
     setImageSize() {
-        const { width, height, margin } = this.#layout
+        const { width, height, marginTop = 0, marginBottom = 0, marginLeft = 0, marginRight = 0 } = this.#layout
         const vertical = this.#vertical
         const doc = this.document
         for (const el of doc.body.querySelectorAll('img, svg, video')) {
@@ -400,9 +400,9 @@ class View {
             setStylesImportant(el, {
                 'max-height': vertical
                     ? (maxHeight !== 'none' && maxHeight !== '0px' ? maxHeight : '100%')
-                    : `${height - margin * 2}px`,
+                    : `${height - marginTop - marginBottom}px`,
                 'max-width': vertical
-                    ? `${width - margin * 2}px`
+                    ? `${width - marginLeft - marginRight}px`
                     : (maxWidth !== 'none' && maxWidth !== '0px' ? maxWidth : '100%'),
                 'object-fit': 'contain',
                 'page-break-inside': 'avoid',
@@ -477,6 +477,7 @@ class View {
 export class Paginator extends HTMLElement {
     static observedAttributes = [
         'flow', 'gap', 'margin',
+        'margin-top', 'margin-bottom', 'margin-left', 'margin-right',
         'max-inline-size', 'max-block-size', 'max-column-count',
     ]
     #root = this.attachShadow({ mode: 'closed' })
@@ -520,6 +521,10 @@ export class Paginator extends HTMLElement {
         #top {
             --_gap: 7%;
             --_margin: 48px;
+            --_margin-top: var(--_margin);
+            --_margin-bottom: var(--_margin);
+            --_margin-left: 0px;
+            --_margin-right: 0px;
             --_max-inline-size: 720px;
             --_max-block-size: 1440px;
             --_max-column-count: 2;
@@ -530,15 +535,15 @@ export class Paginator extends HTMLElement {
             --_max-height: var(--_max-block-size);
             display: grid;
             grid-template-columns:
-                minmax(var(--_half-gap), 1fr)
+                minmax(max(var(--_half-gap), var(--_margin-left)), 1fr)
                 var(--_half-gap)
                 minmax(0, calc(var(--_max-width) - var(--_gap)))
                 var(--_half-gap)
-                minmax(var(--_half-gap), 1fr);
+                minmax(max(var(--_half-gap), var(--_margin-right)), 1fr);
             grid-template-rows:
-                minmax(var(--_margin), 1fr)
+                minmax(var(--_margin-top), 1fr)
                 minmax(0, var(--_max-height))
-                minmax(var(--_margin), 1fr);
+                minmax(var(--_margin-bottom), 1fr);
             &.vertical {
                 --_max-column-count-spread: var(--_max-column-count-portrait);
                 --_max-width: var(--_max-block-size);
@@ -576,9 +581,13 @@ export class Paginator extends HTMLElement {
             grid-row: 3;
             align-self: end;
         }
-        #header, #footer {
+        #header {
             display: grid;
-            height: var(--_margin);
+            height: var(--_margin-top);
+        }
+        #footer {
+            display: grid;
+            height: var(--_margin-bottom);
         }
         :is(#header, #footer) > * {
             display: flex;
@@ -696,9 +705,17 @@ export class Paginator extends HTMLElement {
                 this.render()
                 break
             case 'gap':
-            case 'margin':
             case 'max-block-size':
             case 'max-column-count':
+                this.#top.style.setProperty('--_' + name, value)
+                break
+            case 'margin':
+                this.#top.style.setProperty('--_margin', value)
+                break
+            case 'margin-top':
+            case 'margin-bottom':
+            case 'margin-left':
+            case 'margin-right':
                 this.#top.style.setProperty('--_' + name, value)
                 break
             case 'max-inline-size':
@@ -755,7 +772,14 @@ export class Paginator extends HTMLElement {
         const style = getComputedStyle(this.#top)
         const maxInlineSize = parseFloat(style.getPropertyValue('--_max-inline-size'))
         const maxColumnCount = parseInt(style.getPropertyValue('--_max-column-count-spread'))
-        const margin = parseFloat(style.getPropertyValue('--_margin'))
+        // Per-side margins for geometry; fall back to scalar --_margin
+        const scalarMargin = parseFloat(style.getPropertyValue('--_margin'))
+        const marginTop = parseFloat(style.getPropertyValue('--_margin-top')) || scalarMargin
+        const marginBottom = parseFloat(style.getPropertyValue('--_margin-bottom')) || scalarMargin
+        const marginLeft = parseFloat(style.getPropertyValue('--_margin-left')) || 0
+        const marginRight = parseFloat(style.getPropertyValue('--_margin-right')) || 0
+        // Inline-axis margin for scroll/rect geometry (horizontal in LTR)
+        const margin = vertical ? marginTop : marginLeft
         this.#margin = margin
 
         const g = parseFloat(style.getPropertyValue('--_gap')) / 100
@@ -790,7 +814,7 @@ export class Paginator extends HTMLElement {
             this.#header.replaceChildren()
             this.#footer.replaceChildren()
 
-            return { flow, margin, gap, columnWidth }
+            return { flow, margin, marginTop, marginBottom, marginLeft, marginRight, gap, columnWidth }
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
@@ -814,7 +838,7 @@ export class Paginator extends HTMLElement {
         this.#header.replaceChildren(...heads)
         this.#footer.replaceChildren(...feet)
 
-        return { height, width, margin, gap, columnWidth }
+        return { height, width, margin, marginTop, marginBottom, marginLeft, marginRight, gap, columnWidth }
     }
     render() {
         if (!this.#view) return
