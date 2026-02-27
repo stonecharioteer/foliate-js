@@ -773,11 +773,16 @@ export class Paginator extends HTMLElement {
         const maxInlineSize = parseFloat(style.getPropertyValue('--_max-inline-size'))
         const maxColumnCount = parseInt(style.getPropertyValue('--_max-column-count-spread'))
         // Per-side margins for geometry; fall back to scalar --_margin
-        const scalarMargin = parseFloat(style.getPropertyValue('--_margin'))
-        const marginTop = parseFloat(style.getPropertyValue('--_margin-top')) || scalarMargin
-        const marginBottom = parseFloat(style.getPropertyValue('--_margin-bottom')) || scalarMargin
-        const marginLeft = parseFloat(style.getPropertyValue('--_margin-left')) || 0
-        const marginRight = parseFloat(style.getPropertyValue('--_margin-right')) || 0
+        const parsedScalarMargin = parseFloat(style.getPropertyValue('--_margin'))
+        const scalarMargin = Number.isNaN(parsedScalarMargin) ? 0 : parsedScalarMargin
+        const parseMargin = (name, fallback) => {
+            const parsed = parseFloat(style.getPropertyValue(name))
+            return Number.isNaN(parsed) ? fallback : parsed
+        }
+        const marginTop = parseMargin('--_margin-top', scalarMargin)
+        const marginBottom = parseMargin('--_margin-bottom', scalarMargin)
+        const marginLeft = parseMargin('--_margin-left', 0)
+        const marginRight = parseMargin('--_margin-right', 0)
         // Inline-axis margin for scroll/rect geometry (horizontal in LTR)
         const margin = vertical ? marginTop : marginLeft
         this.#margin = margin
