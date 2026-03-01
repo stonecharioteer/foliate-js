@@ -234,6 +234,7 @@ const isEditableTarget = target => {
     )
 }
 
+const SNAP_MAX_VELOCITY = 2.0 // px/ms; ~1-2 page widths of momentum
 const TOUCH_SELECTION_HOLD_MS = 280
 const TOUCH_SELECTION_DRIFT_PX = 30
 const TOUCH_SELECTION_CORNER_HOLD_MS = 420
@@ -896,7 +897,8 @@ export class Paginator extends HTMLElement {
             element[scrollProp] + delta))
     }
     snap(vx, vy) {
-        const velocity = this.#vertical ? vy : vx
+        const rawVelocity = this.#vertical ? vy : vx
+        const velocity = Math.max(-SNAP_MAX_VELOCITY, Math.min(SNAP_MAX_VELOCITY, rawVelocity))
         const [offset, a, b] = this.#scrollBounds
         const { start, end, pages, size } = this
         const min = Math.abs(offset) - a
@@ -1058,7 +1060,7 @@ export class Paginator extends HTMLElement {
         e.preventDefault()
         const x = touch.screenX, y = touch.screenY
         const dx = state.x - x, dy = state.y - y
-        const dt = e.timeStamp - state.t
+        const dt = Math.max(e.timeStamp - state.t, 1)
         state.x = x
         state.y = y
         state.t = e.timeStamp
