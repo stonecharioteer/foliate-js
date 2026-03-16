@@ -337,6 +337,7 @@ class View {
     }
     render(layout) {
         if (!layout) return
+        if (!this.document) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         if (this.#column) this.columnize(layout)
@@ -695,7 +696,7 @@ export class Paginator extends HTMLElement {
         })
 
         this.#mediaQueryListener = () => {
-            if (!this.#view) return
+            if (!this.#view?.document) return
             this.#background.style.background = getBackground(this.#view.document)
         }
         this.#mediaQuery.addEventListener('change', this.#mediaQueryListener)
@@ -1193,6 +1194,7 @@ export class Paginator extends HTMLElement {
         await this.#scrollToPage(newPage + 1, reason)
     }
     #getVisibleRange() {
+        if (!this.#view?.document) return
         if (this.scrolled) return getVisibleRange(this.#view.document,
             this.start + this.#margin, this.end - this.#margin, this.#getRectMapper())
         const size = this.#rtl ? -this.size : this.size
@@ -1363,14 +1365,16 @@ export class Paginator extends HTMLElement {
         } else $style.textContent = styles
 
         // NOTE: needs `requestAnimationFrame` in Chromium
-        requestAnimationFrame(() =>
-            this.#background.style.background = getBackground(this.#view.document))
+        requestAnimationFrame(() => {
+            if (this.#view?.document)
+                this.#background.style.background = getBackground(this.#view.document)
+        })
 
         // needed because the resize observer doesn't work in Firefox
         this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
     }
     focusView() {
-        this.#view.document.defaultView.focus()
+        this.#view?.document?.defaultView?.focus()
     }
     destroy() {
         this.#observer.unobserve(this)
