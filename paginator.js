@@ -519,6 +519,7 @@ export class Paginator extends HTMLElement {
             overflow: hidden;
             width: 100%;
             height: 100%;
+            touch-action: pan-y;
         }
         #top {
             --_gap: 7%;
@@ -754,7 +755,7 @@ export class Paginator extends HTMLElement {
         }
         this.#view = new View({
             container: this,
-            onExpand: () => this.#scrollToAnchor(this.#anchor),
+            onExpand: () => { if (!this.#locked) this.#scrollToAnchor(this.#anchor) },
         })
         this.#container.append(this.#view.element)
         return this.#view
@@ -853,7 +854,9 @@ export class Paginator extends HTMLElement {
             vertical: this.#vertical,
             rtl: this.#rtl,
         }))
-        this.#scrollToAnchor(this.#anchor)
+        // Skip re-anchoring during a page turn — the turn is actively setting
+        // a new scroll position and re-anchoring would revert it.
+        if (!this.#locked) this.#scrollToAnchor(this.#anchor)
     }
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
@@ -1149,13 +1152,15 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
-            element[scrollProp], offset, 300, easeOutQuad,
-            x => element[scrollProp] = x,
-        ).then(() => {
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
-        })
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) {
+            return animate(
+                element[scrollProp], offset, 300, easeOutQuad,
+                x => element[scrollProp] = x,
+            ).then(() => {
+                this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+                this.#afterScroll(reason)
+            })
+        }
         else {
             element[scrollProp] = offset
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
@@ -1314,13 +1319,23 @@ export class Paginator extends HTMLElement {
         if (this.#locked) return
         this.#locked = true
         const prev = dir === -1
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
-        if (shouldGo) await this.#goTo({
-            index: this.#adjacentIndex(dir),
-            anchor: prev ? () => 1 : () => 0,
-        })
-        if (shouldGo || !this.hasAttribute('animated')) await wait(100)
-        this.#locked = false
+        try {
+            const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+            if (shouldGo) await this.#goTo({
+                index: this.#adjacentIndex(dir),
+                anchor: prev ? () => 1 : () => 0,
+            })
+            if (shouldGo || !this.hasAttribute('animated')) await wait(100)
+            // Let #afterScroll naturally update #anchor via the 'page'
+            // reason (line 1219 excludes only anchor/selection/navigation).
+            // The lock guards prevent the re-anchor loop from reverting
+            // during the turn.  We just need to ensure afterScroll ran
+            // so #anchor reflects the new position before we unlock.
+        } catch (e) {
+            console.error('[PAGINATOR] #turnPage error:', e)
+        } finally {
+            this.#locked = false
+        }
     }
     prev(distance) {
         return this.#turnPage(-1, distance)
