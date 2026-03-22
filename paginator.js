@@ -947,6 +947,20 @@ export class Paginator extends HTMLElement {
         return state.owner === SELECTION_ACTIVE
     }
     #onTouchStart(e) {
+        // Edge touch hook — allows host to claim edge swipes (e.g. back gesture)
+        if (this._edgeTouchCallback && e.touches?.length === 1) {
+            const touch = e.touches[0]
+            const rect = this.getBoundingClientRect()
+            const localX = touch.clientX - rect.left
+            const edge = localX < 30 ? 'left'
+                : rect.width - localX < 30 ? 'right'
+                : null
+            if (edge && this._edgeTouchCallback(edge, e)) {
+                this.#touchState = null
+                this.#clearTouchHoldTimer()
+                return
+            }
+        }
         this.#clearTouchHoldTimer()
         const touch = e.changedTouches[0]
         this.#touchState = {
