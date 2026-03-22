@@ -21,7 +21,12 @@ const createMediaQueryList = query => {
     }
 }
 
-const getViewportScale = () => globalThis.visualViewport?.scale ?? 1
+const getViewportScale = () => {
+    const raw = globalThis.visualViewport?.scale ?? 1
+    // Treat near-1 values as exactly 1 — some Android WebViews report
+    // scales like 1.0001 due to display density rounding.
+    return Math.abs(raw - 1) < 0.01 ? 1 : raw
+}
 
 const debounce = (f, wait, immediate) => {
     let timeout
@@ -947,12 +952,13 @@ export class Paginator extends HTMLElement {
         return state.owner === SELECTION_ACTIVE
     }
     #onTouchStart(e) {
-        // Cancel any in-flight smooth scroll animation so a new swipe
-        // doesn't fight with the previous page turn's animation.
+        // Refresh scroll bounds from current position so a swipe that starts
+        // during a page-turn animation doesn't use stale bounds.
         const container = this.#container
         if (container) {
-            const prop = this.scrollProp
-            container.scrollTo({ [prop]: container[prop], behavior: 'instant' })
+            const { scrollProp, size } = this
+            const currentOffset = Math.round(container[scrollProp] / size) * size
+            this.#scrollBounds = [currentOffset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
         }
         // Edge touch hook — allows host to claim edge swipes (e.g. back gesture)
         if (this._edgeTouchCallback && e.touches?.length === 1) {
