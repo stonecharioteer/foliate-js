@@ -947,6 +947,13 @@ export class Paginator extends HTMLElement {
         return state.owner === SELECTION_ACTIVE
     }
     #onTouchStart(e) {
+        // Cancel any in-flight smooth scroll animation so a new swipe
+        // doesn't fight with the previous page turn's animation.
+        const container = this.#container
+        if (container) {
+            const prop = this.scrollProp
+            container.scrollTo({ [prop]: container[prop], behavior: 'instant' })
+        }
         // Edge touch hook — allows host to claim edge swipes (e.g. back gesture)
         if (this._edgeTouchCallback && e.touches?.length === 1) {
             const touch = e.touches[0]
