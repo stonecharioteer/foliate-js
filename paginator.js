@@ -44,22 +44,30 @@ const debounce = (f, wait, immediate) => {
 
 const lerp = (min, max, x) => x * (max - min) + min
 const easeOutQuad = x => 1 - (1 - x) * (1 - x)
-const animate = (a, b, duration, ease, render) => new Promise(resolve => {
+const easeSpring = t => {
+    const c4 = (2 * Math.PI) / 3
+    return t === 0 ? 0
+        : t === 1 ? 1
+        : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * c4) + 1
+}
+const animate = (a, b, duration, ease, render, signal) => new Promise(resolve => {
     let start
     const step = now => {
+        if (signal?.cancelled) return resolve({ completed: false })
         if (document.hidden) {
             render(lerp(a, b, 1))
-            return resolve()
+            return resolve({ completed: true })
         }
         start ??= now
         const fraction = Math.min(1, (now - start) / duration)
         render(lerp(a, b, ease(fraction)))
         if (fraction < 1) requestAnimationFrame(step)
-        else resolve()
+        else resolve({ completed: true })
     }
+    if (signal?.cancelled) return resolve({ completed: false })
     if (document.hidden) {
         render(lerp(a, b, 1))
-        return resolve()
+        return resolve({ completed: true })
     }
     requestAnimationFrame(step)
 })
@@ -511,6 +519,9 @@ export class Paginator extends HTMLElement {
     #touchHoldTimer
     #touchScrolled
     #lastVisibleRange
+    #swipePreview
+    #peekView
+    #peekLoadToken = 0
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -573,7 +584,9 @@ export class Paginator extends HTMLElement {
         #container {
             grid-column: 2 / 5;
             grid-row: 2;
+            position: relative;
             overflow: hidden;
+            touch-action: pan-y;
         }
         :host([flow="scrolled"]) #container {
             grid-column: 1 / -1;
@@ -707,6 +720,16 @@ export class Paginator extends HTMLElement {
         }
         this.#mediaQuery.addEventListener('change', this.#mediaQueryListener)
     }
+    #applyStylesToDoc(doc, styles = this.#styles) {
+        const $$styles = this.#styleMap.get(doc)
+        if (!$$styles) return
+        const [$beforeStyle, $style] = $$styles
+        if (Array.isArray(styles)) {
+            const [beforeStyle, style] = styles
+            $beforeStyle.textContent = beforeStyle
+            $style.textContent = style
+        } else $style.textContent = styles
+    }
     attributeChangedCallback(name, _, value) {
         switch (name) {
             case 'flow':
@@ -753,26 +776,13 @@ export class Paginator extends HTMLElement {
                     `break-${x}: ${y ?? ''}column`))
         })
     }
-    #createView() {
-        if (this.#view) {
-            this.#view.destroy()
-            this.#container.removeChild(this.#view.element)
+    #computeLayout(vertical, rtl, { updateChrome = false, background } = {}) {
+        if (updateChrome) {
+            this.#vertical = vertical
+            this.#rtl = rtl
+            this.#top.classList.toggle('vertical', vertical)
+            if (background != null) this.#background.style.background = background
         }
-        this.#view = new View({
-            container: this,
-            onExpand: () => { if (!this.#locked) this.#scrollToAnchor(this.#anchor) },
-        })
-        this.#container.append(this.#view.element)
-        return this.#view
-    }
-    #beforeRender({ vertical, rtl, background }) {
-        this.#vertical = vertical
-        this.#rtl = rtl
-        this.#top.classList.toggle('vertical', vertical)
-
-        // set background to `doc` background
-        // this is needed because the iframe does not fill the whole element
-        this.#background.style.background = background
 
         const { width, height } = this.#container.getBoundingClientRect()
         const size = vertical ? height : width
@@ -780,7 +790,6 @@ export class Paginator extends HTMLElement {
         const style = getComputedStyle(this.#top)
         const maxInlineSize = parseFloat(style.getPropertyValue('--_max-inline-size'))
         const maxColumnCount = parseInt(style.getPropertyValue('--_max-column-count-spread'))
-        // Per-side margins for geometry; fall back to scalar --_margin
         const parsedScalarMargin = parseFloat(style.getPropertyValue('--_margin'))
         const scalarMargin = Number.isNaN(parsedScalarMargin) ? 0 : parsedScalarMargin
         const parseMargin = (name, fallback) => {
@@ -791,67 +800,155 @@ export class Paginator extends HTMLElement {
         const marginBottom = parseMargin('--_margin-bottom', scalarMargin)
         const marginLeft = parseMargin('--_margin-left', 0)
         const marginRight = parseMargin('--_margin-right', 0)
-        // Inline-axis margin for scroll/rect geometry (horizontal in LTR)
         const margin = vertical ? marginTop : marginLeft
-        this.#margin = margin
+        if (updateChrome) this.#margin = margin
 
         const g = parseFloat(style.getPropertyValue('--_gap')) / 100
-        // The gap will be a percentage of the #container, not the whole view.
-        // This means the outer padding will be bigger than the column gap. Let
-        // `a` be the gap percentage. The actual percentage for the column gap
-        // will be (1 - a) * a. Let us call this `b`.
-        //
-        // To make them the same, we start by shrinking the outer padding
-        // setting to `b`, but keep the column gap setting the same at `a`. Then
-        // the actual size for the column gap will be (1 - b) * a. Repeating the
-        // process again and again, we get the sequence
-        //     x₁ = (1 - b) * a
-        //     x₂ = (1 - x₁) * a
-        //     ...
-        // which converges to x = (1 - x) * a. Solving for x, x = a / (1 + a).
-        // So to make the spacing even, we must shrink the outer padding with
-        //     f(x) = x / (1 + x).
-        // But we want to keep the outer padding, and make the inner gap bigger.
-        // So we apply the inverse, f⁻¹ = -x / (x - 1) to the column gap.
         const gap = -g / (g - 1) * size
 
         const flow = this.getAttribute('flow')
         if (flow === 'scrolled') {
-            // FIXME: vertical-rl only, not -lr
-            this.setAttribute('dir', vertical ? 'rtl' : 'ltr')
-            this.#top.style.padding = '0'
+            if (updateChrome) {
+                this.setAttribute('dir', vertical ? 'rtl' : 'ltr')
+                this.#top.style.padding = '0'
+                this.heads = null
+                this.feet = null
+                this.#header.replaceChildren()
+                this.#footer.replaceChildren()
+            }
             const columnWidth = maxInlineSize
-
-            this.heads = null
-            this.feet = null
-            this.#header.replaceChildren()
-            this.#footer.replaceChildren()
-
             return { flow, margin, marginTop, marginBottom, marginLeft, marginRight, gap, columnWidth }
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
         const columnWidth = (size / divisor) - gap
-        this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
+        if (updateChrome) this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
 
-        const marginalDivisor = vertical
-            ? Math.min(2, Math.ceil(width / maxInlineSize))
-            : divisor
-        const marginalStyle = {
-            gridTemplateColumns: `repeat(${marginalDivisor}, 1fr)`,
-            gap: `${gap}px`,
-            direction: this.bookDir === 'rtl' ? 'rtl' : 'ltr',
+        if (updateChrome) {
+            const marginalDivisor = vertical
+                ? Math.min(2, Math.ceil(width / maxInlineSize))
+                : divisor
+            const marginalStyle = {
+                gridTemplateColumns: `repeat(${marginalDivisor}, 1fr)`,
+                gap: `${gap}px`,
+                direction: this.bookDir === 'rtl' ? 'rtl' : 'ltr',
+            }
+            Object.assign(this.#header.style, marginalStyle)
+            Object.assign(this.#footer.style, marginalStyle)
+            const heads = makeMarginals(marginalDivisor, 'head')
+            const feet = makeMarginals(marginalDivisor, 'foot')
+            this.heads = heads.map(el => el.children[0])
+            this.feet = feet.map(el => el.children[0])
+            this.#header.replaceChildren(...heads)
+            this.#footer.replaceChildren(...feet)
         }
-        Object.assign(this.#header.style, marginalStyle)
-        Object.assign(this.#footer.style, marginalStyle)
-        const heads = makeMarginals(marginalDivisor, 'head')
-        const feet = makeMarginals(marginalDivisor, 'foot')
-        this.heads = heads.map(el => el.children[0])
-        this.feet = feet.map(el => el.children[0])
-        this.#header.replaceChildren(...heads)
-        this.#footer.replaceChildren(...feet)
 
         return { height, width, margin, marginTop, marginBottom, marginLeft, marginRight, gap, columnWidth }
+    }
+    #createView() {
+        if (this.#view) {
+            this.#view.destroy()
+            this.#container.removeChild(this.#view.element)
+        }
+        this.#view = new View({
+            container: this,
+            onExpand: () => { if (!this.#locked) this.#scrollToAnchor(this.#anchor) },
+        })
+        this.#view.element.style.left = '0'
+        this.#view.element.style.top = '0'
+        this.#container.append(this.#view.element)
+        return this.#view
+    }
+    async #ensurePeekView(direction) {
+        const index = this.#adjacentIndex(direction)
+        if (index == null || this.scrolled) return
+        const existing = this.#peekView
+        if (existing?.index === index && existing.direction === direction) {
+            this.#positionPeekView()
+            return
+        }
+        this.#destroyPeekView()
+        const token = ++this.#peekLoadToken
+        const peek = new View({
+            container: this,
+            onExpand: () => {},
+        })
+        peek.element.style.position = 'absolute'
+        peek.element.style.top = '0'
+        peek.element.style.left = '0'
+        peek.element.style.pointerEvents = 'none'
+        const src = await Promise.resolve(this.sections[index].load()).catch(() => null)
+        if (token !== this.#peekLoadToken || !src) {
+            peek.destroy()
+            return
+        }
+        try {
+            await peek.load(src, doc => {
+                if (doc.head) {
+                    const $styleBefore = doc.createElement('style')
+                    doc.head.prepend($styleBefore)
+                    const $style = doc.createElement('style')
+                    doc.head.append($style)
+                    this.#styleMap.set(doc, [$styleBefore, $style])
+                    this.#applyStylesToDoc(doc)
+                }
+            }, ({ vertical, rtl }) => this.#computeLayout(vertical, rtl))
+        } catch {
+            peek.destroy()
+            return
+        }
+        if (token !== this.#peekLoadToken) {
+            peek.destroy()
+            return
+        }
+        this.#peekView = { view: peek, index, direction }
+        this.#container.append(peek.element)
+        this.#positionPeekView()
+    }
+    #destroyPeekView() {
+        this.#peekLoadToken += 1
+        const peek = this.#peekView
+        if (!peek) return
+        peek.view.destroy()
+        peek.view.element.remove()
+        this.sections[peek.index]?.unload?.()
+        this.#styleMap.delete(peek.view.document)
+        this.#peekView = null
+    }
+    #positionPeekView() {
+        const peek = this.#peekView
+        if (!peek || this.scrolled) return
+        const axis = this.#vertical ? 'top' : 'left'
+        const cross = this.#vertical ? 'left' : 'top'
+        const homeOffset = this.#container[this.scrollProp]
+        const peekSize = Math.round(peek.view.element.getBoundingClientRect()[this.sideProp] / this.size)
+        if (!peekSize) return
+        const peekLastContentPage = Math.max(1, peekSize - 2)
+        const startOffset = peek.direction > 0
+            ? homeOffset
+            : homeOffset - this.size - (peekLastContentPage * this.size)
+        peek.view.element.style[axis] = `${startOffset}px`
+        peek.view.element.style[cross] = '0px'
+    }
+    #syncPeekView() {
+        if (this.scrolled || !this.#view) {
+            this.#destroyPeekView()
+            return
+        }
+        const atFirstContent = this.page <= this.#firstContentPage
+        const atLastContent = this.page >= this.#lastContentPage
+        if (atLastContent && this.#adjacentIndex(1) != null) {
+            this.#ensurePeekView(1)
+            return
+        }
+        if (atFirstContent && this.#adjacentIndex(-1) != null) {
+            this.#ensurePeekView(-1)
+            return
+        }
+        this.#destroyPeekView()
+    }
+    #beforeRender({ vertical, rtl, background }) {
+        return this.#computeLayout(vertical, rtl, { updateChrome: true, background })
     }
     render() {
         if (!this.#view) return
@@ -859,6 +956,10 @@ export class Paginator extends HTMLElement {
             vertical: this.#vertical,
             rtl: this.#rtl,
         }))
+        if (this.#peekView) {
+            this.#peekView.view.render(this.#computeLayout(this.#vertical, this.#rtl))
+            this.#positionPeekView()
+        }
         // Skip re-anchoring during a page turn — the turn is actively setting
         // a new scroll position and re-anchoring would revert it.
         if (!this.#locked) this.#scrollToAnchor(this.#anchor)
@@ -894,6 +995,62 @@ export class Paginator extends HTMLElement {
     get pages() {
         return Math.round(this.viewSize / this.size)
     }
+    // Paginated layout adds one padding page at each end.
+    // Content pages occupy indices 1 .. pages-2.
+    get #firstContentPage() { return 1 }
+    get #lastContentPage() { return this.pages - 2 }
+    get #contentPageCount() { return Math.max(0, this.pages - 2) }
+    #getPreviewTransformValue(displacement = this.#swipePreview?.displacement ?? 0) {
+        return this.#rtl ? displacement : -displacement
+    }
+    #applySwipePreviewTransform(displacement = this.#swipePreview?.displacement ?? 0) {
+        const prop = this.#vertical ? 'translateY' : 'translateX'
+        const transform = `${prop}(${this.#getPreviewTransformValue(displacement)}px)`
+        if (this.#view?.element) this.#view.element.style.transform = transform
+        if (this.#peekView?.view?.element) this.#peekView.view.element.style.transform = transform
+    }
+    #clearSwipePreviewTransform() {
+        this.#view?.element?.style?.removeProperty('transform')
+        this.#peekView?.view?.element?.style?.removeProperty('transform')
+    }
+    #clearSwipePreview() {
+        this.#swipePreview = null
+        this.#clearSwipePreviewTransform()
+    }
+    #cancelRunningAnimation(clearTransform = false) {
+        if (this._animationSignal) {
+            this._animationSignal.cancelled = true
+            this._animationSignal = null
+        }
+        if (clearTransform) this.#clearSwipePreviewTransform()
+    }
+    async #cancelSwipePreview() {
+        const preview = this.#swipePreview
+        if (!preview) return
+        if (Math.abs(preview.displacement) <= 1 || !this.hasAttribute('animated')) {
+            this.#clearSwipePreview()
+            return
+        }
+        this.#cancelRunningAnimation()
+        const signal = { cancelled: false }
+        this._animationSignal = signal
+        const start = preview.displacement
+        const { completed } = await animate(start, 0, 300, easeSpring, value => {
+            if (!this.#swipePreview) return
+            this.#swipePreview.displacement = value
+            this.#applySwipePreviewTransform(value)
+        }, signal)
+        if (!completed) return
+        this.#clearSwipePreview()
+    }
+    async #commitSwipePreview(forward) {
+        this.#cancelRunningAnimation()
+        this.#clearSwipePreview()
+        // Let prev()/next() animate normally — the 300ms animation keeps
+        // #locked=true, preventing re-anchor races that snap the page back.
+        // This also gives swipe commit the same smooth finish as tap-to-turn.
+        return forward ? await this.next() : await this.prev()
+    }
     scrollBy(dx, dy) {
         const delta = this.#vertical ? dy : dx
         const element = this.#container
@@ -918,7 +1075,8 @@ export class Paginator extends HTMLElement {
                 + (isNaN(d) ? 0 : d))) / size)
 
         this.#scrollToPage(page, 'snap').then(() => {
-            const dir = page <= 0 ? -1 : page >= pages - 1 ? 1 : null
+            const dir = page < this.#firstContentPage ? -1
+                : page > this.#lastContentPage ? 1 : null
             if (dir) return this.#goTo({
                 index: this.#adjacentIndex(dir),
                 anchor: dir < 0 ? () => 1 : () => 0,
@@ -952,14 +1110,6 @@ export class Paginator extends HTMLElement {
         return state.owner === SELECTION_ACTIVE
     }
     #onTouchStart(e) {
-        // Refresh scroll bounds from current position so a swipe that starts
-        // during a page-turn animation doesn't use stale bounds.
-        const container = this.#container
-        if (container) {
-            const { scrollProp, size } = this
-            const currentOffset = Math.round(container[scrollProp] / size) * size
-            this.#scrollBounds = [currentOffset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-        }
         // Edge touch hook — allows host to claim edge swipes (e.g. back gesture)
         if (this._edgeTouchCallback && e.touches?.length === 1) {
             const touch = e.touches[0]
@@ -972,6 +1122,22 @@ export class Paginator extends HTMLElement {
                 this.#touchState = null
                 this.#clearTouchHoldTimer()
                 return
+            }
+        }
+        this.#cancelRunningAnimation(true)
+        const container = this.#container
+        if (container && !this.scrolled) {
+            const { scrollProp, size } = this
+            container[scrollProp] = Math.round(container[scrollProp] / size) * size
+            const hasPrev = this.page > this.#firstContentPage
+                || this.#adjacentIndex(-1) != null
+            const hasNext = this.page < this.#lastContentPage
+                || this.#adjacentIndex(1) != null
+            this.#swipePreview = {
+                homeOffset: container[scrollProp],
+                displacement: 0,
+                maxBackward: hasPrev ? size : 0,
+                maxForward: hasNext ? size : 0,
             }
         }
         this.#clearTouchHoldTimer()
@@ -1077,11 +1243,15 @@ export class Paginator extends HTMLElement {
         const driftX = Math.abs(touch.screenX - state.startX)
         const driftY = Math.abs(touch.screenY - state.startY)
 
-        // Don't scroll the paginator until the finger has moved enough to
-        // clearly indicate a swipe (~30px / ~5mm).  We intentionally do NOT
-        // call preventDefault() here so the browser's long-press text
-        // selection can initiate normally.  The reader layout uses
-        // overflow:hidden to prevent body scrolling during this window.
+        // Prevent default early if horizontal movement is detected, even
+        // below the drift threshold. On Android WebView, if we don't prevent
+        // default on early touchmove events, the browser starts native
+        // scrolling and later touchmove events become non-cancelable,
+        // breaking our swipe handling entirely.
+        if (driftX > 5 && driftX > driftY) {
+            e.preventDefault()
+        }
+
         if (driftX <= TOUCH_SELECTION_DRIFT_PX
             && driftY <= TOUCH_SELECTION_DRIFT_PX) return
 
@@ -1098,7 +1268,14 @@ export class Paginator extends HTMLElement {
         state.vx = dx / dt
         state.vy = dy / dt
         this.#touchScrolled = true
-        this.scrollBy(dx, dy)
+        const preview = this.#swipePreview
+        if (!preview) return
+        const delta = this.#vertical ? dy : dx
+        preview.displacement = Math.max(-preview.maxBackward, Math.min(
+            preview.maxForward,
+            preview.displacement + delta,
+        ))
+        this.#applySwipePreviewTransform(preview.displacement)
     }
     #hasActiveSelection() {
         // Check both the outer document and the iframe document for
@@ -1135,12 +1312,26 @@ export class Paginator extends HTMLElement {
         if (owner === SELECTION_PRIMED) return
         if (owner !== TOUCH_SWIPE) return
 
-        // XXX: Firefox seems to report scale as 1... sometimes...?
-        // at this point I'm basically throwing `requestAnimationFrame` at
-        // anything that doesn't work
+        // Use requestAnimationFrame to let the browser settle viewport
+        // scale after pinch gestures before deciding on navigation.
         requestAnimationFrame(() => {
-            if (getViewportScale() === 1)
-                this.snap(vx, vy)
+            if (getViewportScale() !== 1) return
+
+            const displacement = this.#swipePreview?.displacement ?? 0
+            const absDisplacement = Math.abs(displacement)
+            const { size } = this
+
+            const velocity = this.#vertical ? Math.abs(vy) : Math.abs(vx)
+            const shouldTurn = absDisplacement > size * 0.15 || velocity > 0.3
+
+            if (shouldTurn && absDisplacement > 1) {
+                const forward = (displacement > 0) !== this.#rtl
+                this.#commitSwipePreview(forward)
+            } else if (absDisplacement > 1) {
+                this.#cancelSwipePreview()
+            } else {
+                this.#clearSwipePreview()
+            }
         })
     }
     // allows one to process rects as if they were LTR and horizontal
@@ -1179,11 +1370,22 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) {
+        const animateScroll = (reason === 'snap' || smooth)
+            && this.hasAttribute('animated')
+        if (animateScroll) {
+            // Cancel any in-flight animation before starting a new one
+            if (this._animationSignal) this._animationSignal.cancelled = true
+            const signal = { cancelled: false }
+            this._animationSignal = signal
             return animate(
                 element[scrollProp], offset, 300, easeOutQuad,
                 x => element[scrollProp] = x,
-            ).then(() => {
+                signal,
+            ).then(({ completed }) => {
+                // Cancelled animations must not commit state — doing so
+                // overwrites scrollBounds with stale values and corrupts
+                // the next gesture.
+                if (!completed) return
                 this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
                 this.#afterScroll(reason)
             })
@@ -1219,11 +1421,10 @@ export class Paginator extends HTMLElement {
             await this.#scrollTo(anchor * this.viewSize, reason)
             return
         }
-        const { pages } = this
-        if (!pages) return
-        const textPages = pages - 2
-        const newPage = Math.round(anchor * (textPages - 1))
-        await this.#scrollToPage(newPage + 1, reason)
+        const count = this.#contentPageCount
+        if (!count) return
+        const newPage = Math.round(anchor * (count - 1))
+        await this.#scrollToPage(newPage + this.#firstContentPage, reason)
     }
     #getVisibleRange() {
         if (!this.#view?.document) return
@@ -1238,20 +1439,37 @@ export class Paginator extends HTMLElement {
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
-        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
-            this.#anchor = range
+        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor') {
+            // For page turns in paginated mode, use a fraction anchor instead
+            // of a DOM Range. Range anchors can resolve to the wrong page when
+            // content elements (headings, images) have bounding rects that
+            // bleed across column boundaries. Fractions map deterministically
+            // to page numbers and cannot drift.
+            if (reason === 'page' && !this.scrolled && this.#contentPageCount > 0) {
+                const { page } = this
+                // Use (count - 1) as divisor to match #scrollToAnchor's decode:
+                // Math.round(fraction * (count - 1)) + firstContentPage
+                // This maps first content page → 0, last content page → 1.
+                const divisor = Math.max(1, this.#contentPageCount - 1)
+                this.#anchor = (page - this.#firstContentPage) / divisor
+            } else {
+                this.#anchor = range
+            }
+        }
         else this.#justAnchored = true
 
         const index = this.#index
         const detail = { reason, range, index }
         if (this.scrolled) detail.fraction = this.start / this.viewSize
-        else if (this.pages > 0) {
-            const { page, pages } = this
-            this.#header.style.visibility = page > 1 ? 'visible' : 'hidden'
-            detail.fraction = (page - 1) / (pages - 2)
-            detail.size = 1 / (pages - 2)
+        else if (this.#contentPageCount > 0) {
+            const { page } = this
+            const count = this.#contentPageCount
+            this.#header.style.visibility = page > this.#firstContentPage ? 'visible' : 'hidden'
+            detail.fraction = (page - this.#firstContentPage) / count
+            detail.size = 1 / count
         }
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
+        this.#syncPeekView()
     }
     async #display(promise) {
         const { index, src, anchor, onLoad, select } = await promise
@@ -1318,7 +1536,8 @@ export class Paginator extends HTMLElement {
         }
         if (this.atStart) return
         const page = this.page - 1
-        return this.#scrollToPage(page, 'page', true).then(() => page <= 0)
+        return this.#scrollToPage(page, 'page', true)
+            .then(() => page < this.#firstContentPage)
     }
     #scrollNext(distance) {
         if (!this.#view) return true
@@ -1329,14 +1548,16 @@ export class Paginator extends HTMLElement {
         }
         if (this.atEnd) return
         const page = this.page + 1
-        const pages = this.pages
-        return this.#scrollToPage(page, 'page', true).then(() => page >= pages - 1)
+        return this.#scrollToPage(page, 'page', true)
+            .then(() => page > this.#lastContentPage)
     }
     get atStart() {
-        return this.#adjacentIndex(-1) == null && this.page <= 1
+        return this.#adjacentIndex(-1) == null
+            && this.page <= this.#firstContentPage
     }
     get atEnd() {
-        return this.#adjacentIndex(1) == null && this.page >= this.pages - 2
+        return this.#adjacentIndex(1) == null
+            && this.page >= this.#lastContentPage
     }
     #adjacentIndex(dir) {
         for (let index = this.#index + dir; this.#canGoToIndex(index); index += dir)
@@ -1397,14 +1618,8 @@ export class Paginator extends HTMLElement {
     }
     setStyles(styles) {
         this.#styles = styles
-        const $$styles = this.#styleMap.get(this.#view?.document)
-        if (!$$styles) return
-        const [$beforeStyle, $style] = $$styles
-        if (Array.isArray(styles)) {
-            const [beforeStyle, style] = styles
-            $beforeStyle.textContent = beforeStyle
-            $style.textContent = style
-        } else $style.textContent = styles
+        if (this.#view?.document) this.#applyStylesToDoc(this.#view.document, styles)
+        if (this.#peekView?.view?.document) this.#applyStylesToDoc(this.#peekView.view.document, styles)
 
         // NOTE: needs `requestAnimationFrame` in Chromium
         requestAnimationFrame(() => {
@@ -1414,12 +1629,17 @@ export class Paginator extends HTMLElement {
 
         // needed because the resize observer doesn't work in Firefox
         this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
+        this.#peekView?.view?.document?.fonts?.ready?.then(() => {
+            this.#peekView?.view?.expand()
+            this.#positionPeekView()
+        })
     }
     focusView() {
         this.#view?.document?.defaultView?.focus()
     }
     destroy() {
         this.#observer.unobserve(this)
+        this.#destroyPeekView()
         this.#view.destroy()
         this.#view = null
         this.sections[this.#index]?.unload?.()
