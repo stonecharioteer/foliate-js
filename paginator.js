@@ -230,6 +230,15 @@ const getBackground = doc => {
         : bodyStyle.background
 }
 
+const getSafeBackground = doc => {
+    try {
+        if (!doc?.defaultView || !doc.body || !doc.documentElement) return null
+        return getBackground(doc)
+    } catch {
+        return null
+    }
+}
+
 const getTargetElement = target =>
     target?.nodeType === Node.ELEMENT_NODE ? target : target?.parentElement ?? null
 
@@ -507,7 +516,7 @@ export class Paginator extends HTMLElement {
     #rtl = false
     #margin = 0
     #index = -1
-    #anchor = 0 // anchor view to a fraction (0-1), Range, or Element
+    #anchor = 0 // anchor view to a fraction (0-1), Range, Element, or logical page
     #justAnchored = false
     #locked = false // while true, prevent any further navigation
     #styles
@@ -1000,6 +1009,10 @@ export class Paginator extends HTMLElement {
     get #firstContentPage() { return 1 }
     get #lastContentPage() { return this.pages - 2 }
     get #contentPageCount() { return Math.max(0, this.pages - 2) }
+    #isPageAnchor(anchor) {
+        return !!anchor && typeof anchor === 'object' && anchor.type === 'page'
+            && Number.isFinite(anchor.page)
+    }
     #getPreviewTransformValue(displacement = this.#swipePreview?.displacement ?? 0) {
         return this.#rtl ? displacement : -displacement
     }
@@ -1040,7 +1053,10 @@ export class Paginator extends HTMLElement {
             this.#swipePreview.displacement = value
             this.#applySwipePreviewTransform(value)
         }, signal)
-        if (!completed) return
+        if (!completed) {
+            this.#clearSwipePreview()
+            return
+        }
         this.#clearSwipePreview()
     }
     async #commitSwipePreview(forward) {
@@ -1405,6 +1421,11 @@ export class Paginator extends HTMLElement {
     }
     async #scrollToAnchor(anchor, reason = 'anchor') {
         this.#anchor = anchor
+        if (!this.scrolled && this.#isPageAnchor(anchor)) {
+            const page = Math.max(this.#firstContentPage, Math.min(this.#lastContentPage, anchor.page))
+            await this.#scrollToPage(page, reason)
+            return
+        }
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
         if (rects) {
@@ -1440,18 +1461,11 @@ export class Paginator extends HTMLElement {
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
         if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor') {
-            // For page turns in paginated mode, use a fraction anchor instead
-            // of a DOM Range. Range anchors can resolve to the wrong page when
-            // content elements (headings, images) have bounding rects that
-            // bleed across column boundaries. Fractions map deterministically
-            // to page numbers and cannot drift.
-            if (reason === 'page' && !this.scrolled && this.#contentPageCount > 0) {
-                const { page } = this
-                // Use (count - 1) as divisor to match #scrollToAnchor's decode:
-                // Math.round(fraction * (count - 1)) + firstContentPage
-                // This maps first content page → 0, last content page → 1.
-                const divisor = Math.max(1, this.#contentPageCount - 1)
-                this.#anchor = (page - this.#firstContentPage) / divisor
+            // Page turns in paginated mode should restore the exact logical
+            // page they landed on. Range anchors can drift when headings or
+            // other block elements bleed across column boundaries.
+            if (reason === 'page' && !this.scrolled) {
+                this.#anchor = { type: 'page', page: this.page }
             } else {
                 this.#anchor = range
             }
@@ -1464,8 +1478,9 @@ export class Paginator extends HTMLElement {
         else if (this.#contentPageCount > 0) {
             const { page } = this
             const count = this.#contentPageCount
+            const divisor = Math.max(1, count - 1)
             this.#header.style.visibility = page > this.#firstContentPage ? 'visible' : 'hidden'
-            detail.fraction = (page - this.#firstContentPage) / count
+            detail.fraction = (page - this.#firstContentPage) / divisor
             detail.size = 1 / count
         }
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
@@ -1621,16 +1636,23 @@ export class Paginator extends HTMLElement {
         if (this.#view?.document) this.#applyStylesToDoc(this.#view.document, styles)
         if (this.#peekView?.view?.document) this.#applyStylesToDoc(this.#peekView.view.document, styles)
 
+        const currentView = this.#view
+        const currentPeek = this.#peekView
         // NOTE: needs `requestAnimationFrame` in Chromium
         requestAnimationFrame(() => {
-            if (this.#view?.document)
-                this.#background.style.background = getBackground(this.#view.document)
+            if (this.#view !== currentView) return
+            const background = getSafeBackground(currentView?.document)
+            if (background != null) this.#background.style.background = background
         })
 
         // needed because the resize observer doesn't work in Firefox
-        this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
-        this.#peekView?.view?.document?.fonts?.ready?.then(() => {
-            this.#peekView?.view?.expand()
+        currentView?.document?.fonts?.ready?.then(() => {
+            if (this.#view !== currentView || !currentView?.document?.body) return
+            currentView.expand()
+        })
+        currentPeek?.view?.document?.fonts?.ready?.then(() => {
+            if (this.#peekView !== currentPeek || !currentPeek?.view?.document?.body) return
+            currentPeek.view.expand()
             this.#positionPeekView()
         })
     }
