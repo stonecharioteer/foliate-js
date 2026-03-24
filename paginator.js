@@ -1588,7 +1588,8 @@ export class Paginator extends HTMLElement {
                 index: this.#adjacentIndex(dir),
                 anchor: prev ? () => 1 : () => 0,
             })
-            if (shouldGo || !this.hasAttribute('animated')) await wait(100)
+            if (shouldGo) await wait(100)
+            else if (!this.hasAttribute('animated')) await new Promise(r => requestAnimationFrame(r))
             // Let #afterScroll naturally update #anchor via the 'page'
             // reason (line 1219 excludes only anchor/selection/navigation).
             // The lock guards prevent the re-anchor loop from reverting
