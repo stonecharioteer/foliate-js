@@ -43,9 +43,11 @@ export class Overlayer {
         // loop in reverse to hit more recently added items first
         for (let i = arr.length - 1; i >= 0; i--) {
             const [key, obj] = arr[i]
-            for (const { left, top, right, bottom } of obj.rects)
+            for (const rect of obj.rects) {
+                const { left, top, right, bottom } = rect
                 if (top <= y && left <= x && bottom > y && right > x)
-                    return [key, obj.range]
+                    return [key, obj.range, rect]
+            }
         }
         return []
     }
@@ -174,4 +176,3 @@ export class Overlayer {
         return image
     }
 }
-
