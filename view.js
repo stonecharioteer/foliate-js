@@ -5,6 +5,19 @@ import { textWalker } from './text-walker.js'
 
 const SEARCH_PREFIX = 'foliate-search:'
 
+const getEventPoint = e => {
+    if (typeof e.x === 'number' && typeof e.y === 'number')
+        return { x: e.x, y: e.y }
+    if (typeof e.clientX === 'number' && typeof e.clientY === 'number')
+        return { x: e.clientX, y: e.clientY }
+    const touch = e.changedTouches?.[0] ?? e.touches?.[0]
+    if (touch) return { x: touch.clientX, y: touch.clientY }
+    return null
+}
+
+const isAnnotationValue = value =>
+    typeof value === 'string' && value && !value.startsWith(SEARCH_PREFIX)
+
 const isZip = async file => {
     const arr = new Uint8Array(await file.slice(0, 4).arrayBuffer())
     return arr[0] === 0x50 && arr[1] === 0x4b && arr[2] === 0x03 && arr[3] === 0x04
@@ -403,10 +416,30 @@ export class View extends HTMLElement {
     }
     #createOverlayer({ doc, index }) {
         const overlayer = new Overlayer()
+        const getAnnotationHit = e => {
+            const point = getEventPoint(e)
+            if (!point) return []
+            const [value, range, rect] = overlayer.hitTest(point)
+            return isAnnotationValue(value) ? [value, range, rect] : []
+        }
+        const stopAnnotationPointerEvent = e => {
+            const [value] = getAnnotationHit(e)
+            if (value) e.stopPropagation()
+        }
+        for (const eventName of [
+            'pointerdown',
+            'pointerup',
+            'mousedown',
+            'mouseup',
+            'touchstart',
+            'touchend',
+        ]) doc.addEventListener(eventName, stopAnnotationPointerEvent, true)
         doc.addEventListener('click', e => {
-            const [value, range] = overlayer.hitTest(e)
-            if (value && !value.startsWith(SEARCH_PREFIX)) {
-                this.#emit('show-annotation', { value, index, range })
+            const [value, range, rect] = getAnnotationHit(e)
+            if (value) {
+                e.preventDefault()
+                e.stopPropagation()
+                this.#emit('show-annotation', { value, index, range, rect })
             }
         }, false)
         doc.addEventListener('mousemove', e => {
