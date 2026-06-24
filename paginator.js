@@ -1009,6 +1009,87 @@ export class Paginator extends HTMLElement {
     get #firstContentPage() { return 1 }
     get #lastContentPage() { return this.pages - 2 }
     get #contentPageCount() { return Math.max(0, this.pages - 2) }
+    // ── Page-curl capture (MER-171) ───────────────────────────────────────
+    // Returns reparent-safe DOM surfaces for the current page and the adjacent
+    // page in `direction` WITHOUT committing navigation, for the owned curl
+    // animation. Same-section turns only (returns null at section edges so the
+    // caller can commit without animation). Clones the already-laid-out live
+    // document into a shadow root and translates to the target column, so it is
+    // safe to reparent (unlike an iframe) and needs no async reload.
+    capturePages(direction) {
+        try {
+            if (this.scrolled || !this.#view?.document) return null
+            const doc = this.#view.document
+            const rect = this.#container.getBoundingClientRect()
+            const pageW = rect.width, pageH = rect.height
+            const size = this.size
+            const pages = this.pages
+            const page = this.page
+            const first = 1, last = pages - 2
+            const dir = direction === 'next' ? 1 : -1
+            let incomingPage
+            if (dir > 0) {
+                if (page < last) incomingPage = page + 1
+                else return null
+            } else {
+                if (page > first) incomingPage = page - 1
+                else return null
+            }
+            const current = this.#cloneDocPage(doc, page, { pageW, pageH, size, pages })
+            const incoming = this.#cloneDocPage(doc, incomingPage, { pageW, pageH, size, pages })
+            if (!current || !incoming) return null
+            return { current, incoming, width: pageW, height: pageH }
+        } catch {
+            return null
+        }
+    }
+    #cloneDocPage(doc, page, { pageW, pageH, size, pages }) {
+        const wrapper = document.createElement('div')
+        Object.assign(wrapper.style, {
+            position: 'absolute', width: `${pageW}px`, height: `${pageH}px`,
+            // Fall back to transparent (not white) so the curl engine's themed
+            // backdrop shows through on dark/sepia rather than flashing white.
+            overflow: 'hidden', background: getBackground(doc) || 'transparent',
+        })
+        const shadow = wrapper.attachShadow({ mode: 'open' })
+        // Carry the section's stylesheets into the shadow scope so text fidelity
+        // holds outside the iframe. Resolve <link> hrefs to absolute so relative
+        // stylesheet/font URLs don't break against the parent document origin.
+        for (const node of doc.head?.querySelectorAll('style, link[rel="stylesheet"]') ?? []) {
+            const clone = node.cloneNode(true)
+            if (clone.tagName === 'LINK' && node.href) clone.href = node.href
+            shadow.appendChild(clone)
+        }
+        // Content page `page` lives at iframe-local column offset size*(page-1)
+        // (paginated layout adds one leading padding page).
+        const localOffset = size * (page - 1)
+        const totalSize = pages * size
+        const positioner = document.createElement('div')
+        Object.assign(positioner.style, {
+            position: 'absolute', top: '0', left: '0',
+            transform: this.#vertical
+                ? `translateY(${this.#rtl ? localOffset : -localOffset}px)`
+                : `translateX(${this.#rtl ? localOffset : -localOffset}px)`,
+        })
+        // Column container reproduces the iframe's documentElement (column styles
+        // are inline) but is widened so all columns are visible/translatable.
+        const root = document.createElement('div')
+        root.style.cssText = doc.documentElement.style.cssText
+        root.style.setProperty('overflow', 'visible', 'important')
+        root.style.setProperty('margin', '0', 'important')
+        if (this.#vertical) {
+            root.style.setProperty('width', `${pageW}px`, 'important')
+            root.style.setProperty('height', `${totalSize}px`, 'important')
+        } else {
+            root.style.setProperty('width', `${totalSize}px`, 'important')
+            root.style.setProperty('height', `${pageH}px`, 'important')
+        }
+        const bodyClone = doc.body.cloneNode(true)
+        root.appendChild(bodyClone)
+        positioner.appendChild(root)
+        shadow.appendChild(positioner)
+        return wrapper
+    }
     #isPageAnchor(anchor) {
         return !!anchor && typeof anchor === 'object' && anchor.type === 'page'
             && Number.isFinite(anchor.page)
