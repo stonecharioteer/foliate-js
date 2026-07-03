@@ -1324,8 +1324,20 @@ export class Paginator extends HTMLElement {
         this.#touchState = null
         this.#setTouchStateIdle()
         if (this.scrolled) return
-        if (owner === SELECTION_ACTIVE) return
-        if (owner === SELECTION_PRIMED) return
+        if (owner === SELECTION_ACTIVE || owner === SELECTION_PRIMED) {
+            // Native selection auto-scroll can strand the container between
+            // page boundaries while the finger drags near an edge (Merrilin
+            // MER-216/MER-54: reader rested mid-page showing halves of two
+            // columns). Snap back to the nearest page whenever a selection
+            // touch sequence ends.
+            const container = this.#container
+            if (container) {
+                const { scrollProp, size } = this
+                const aligned = Math.round(container[scrollProp] / size) * size
+                if (container[scrollProp] !== aligned) container[scrollProp] = aligned
+            }
+            return
+        }
         if (owner !== TOUCH_SWIPE) return
 
         // Use requestAnimationFrame to let the browser settle viewport
