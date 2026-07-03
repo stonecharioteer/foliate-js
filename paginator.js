@@ -1240,8 +1240,13 @@ export class Paginator extends HTMLElement {
 
         const selecting = this.#syncTouchSelectionOwnership()
         if (state.owner === SELECTION_ACTIVE) {
-            if (selecting) this.#maybeTurnTouchSelectionPage(touch, e.timeStamp)
-            else this.#resetTouchSelectionCornerHold()
+            // Merrilin (MER-54/MER-216): cross-page selection is disabled by
+            // product decision — selection anchors to the visible page, so the
+            // corner-hold auto page turn during selection is intentionally NOT
+            // invoked (this.#maybeTurnTouchSelectionPage). Turning mid-selection
+            // extended the selection into the next page in ways users could not
+            // see or control.
+            this.#resetTouchSelectionCornerHold()
             return
         }
         if (state.owner === SELECTION_PRIMED) {
