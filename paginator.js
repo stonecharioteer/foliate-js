@@ -1135,31 +1135,18 @@ export class Paginator extends HTMLElement {
         if (!size) return null
         return Math.round(this.#container[scrollProp] / size) * size
     }
-    // Page offsets are fractional (size comes from getBoundingClientRect) but
-    // Blink coerces scrollLeft, so exact equality never holds on Android. A
-    // sub-pixel "correction" is a REAL programmatic scroll fired between
-    // Chrome's caret-down and handle-anchor phases of a long-press, which
-    // corrupts selection anchoring at block boundaries (long-press on the
-    // first word of a paragraph anchored at the paragraph END). Only scroll
-    // when meaningfully misaligned, and pin the browser-coerced value so
-    // enforcement compares against what the browser actually stores.
-    static #SCROLL_ALIGN_TOLERANCE = 1
     #snapContainerToPageBoundary() {
         const offset = this.#currentPageScrollOffset()
         if (offset == null) return
         const { scrollProp } = this
-        if (Math.abs(this.#container[scrollProp] - offset) > Paginator.#SCROLL_ALIGN_TOLERANCE)
-            this.#container[scrollProp] = offset
+        if (this.#container[scrollProp] !== offset) this.#container[scrollProp] = offset
     }
     #pinSelectionScroll() {
         if (this.scrolled || !this.#container) return
-        if (this.#selectionScrollPin != null) return this.#enforceSelectionScrollPin()
-        const offset = this.#currentPageScrollOffset()
+        const offset = this.#selectionScrollPin ?? this.#currentPageScrollOffset()
         if (offset == null) return
-        const { scrollProp } = this
-        if (Math.abs(this.#container[scrollProp] - offset) > Paginator.#SCROLL_ALIGN_TOLERANCE)
-            this.#container[scrollProp] = offset
-        this.#selectionScrollPin = this.#container[scrollProp]
+        this.#selectionScrollPin = offset
+        this.#enforceSelectionScrollPin()
     }
     #clearSelectionScrollPin() {
         this.#selectionScrollPin = null
@@ -1171,8 +1158,7 @@ export class Paginator extends HTMLElement {
             return
         }
         const { scrollProp } = this
-        if (Math.abs(this.#container[scrollProp] - this.#selectionScrollPin)
-            > Paginator.#SCROLL_ALIGN_TOLERANCE)
+        if (this.#container[scrollProp] !== this.#selectionScrollPin)
             this.#container[scrollProp] = this.#selectionScrollPin
     }
     #setTouchOwnership(owner) {
