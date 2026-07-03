@@ -527,6 +527,12 @@ export class Paginator extends HTMLElement {
     #touchState
     #touchHoldTimer
     #touchScrolled
+    // While a native touch selection is active, pin paginated scroll to the
+    // current page. Android Chrome drags selection handles in browser chrome,
+    // without delivering touchmove/touchend to the page, but it still
+    // auto-scrolls the overflow container near edges. Pinning prevents that
+    // browser-owned handle drag from making adjacent columns genuinely visible.
+    #selectionScrollPin
     #lastVisibleRange
     #swipePreview
     #peekView
@@ -653,7 +659,10 @@ export class Paginator extends HTMLElement {
         // Chrome can throw during createElement if attributes are mutated here.
 
         this.#observer.observe(this.#container)
-        this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
+        this.#container.addEventListener('scroll', () => {
+            this.#enforceSelectionScrollPin()
+            this.dispatchEvent(new Event('scroll'))
+        })
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
                 if (this.#justAnchored) this.#justAnchored = false
@@ -703,12 +712,22 @@ export class Paginator extends HTMLElement {
             doc.addEventListener('keydown', () => isKeyboardSelecting = true)
             doc.addEventListener('keyup', () => isKeyboardSelecting = false)
             doc.addEventListener('selectionchange', () => {
-                this.#syncTouchSelectionOwnership()
+                const ownsTouchSelection = this.#syncTouchSelectionOwnership()
                 if (this.scrolled) return
+                const sel = doc.getSelection()
+                const hasRange = sel && !sel.isCollapsed
+                    && sel.rangeCount > 0 && sel.type === 'Range'
+                if (hasRange
+                    && (ownsTouchSelection || (!isPointerSelecting && !isKeyboardSelecting))) {
+                    // Android Chrome selection-handle drags are browser UI, not
+                    // page touch events. Keep the paginated container pinned so
+                    // handle auto-scroll cannot expose the next/previous column.
+                    this.#pinSelectionScroll()
+                }
+                else if (!hasRange) this.#clearSelectionScrollPin()
                 const range = this.#lastVisibleRange
                 if (!range) return
-                const sel = doc.getSelection()
-                if (!sel.rangeCount) return
+                if (!sel?.rangeCount) return
                 if (isPointerSelecting && sel.type === 'Range')
                     checkPointerSelection(range, sel)
                 else if (isKeyboardSelecting) {
@@ -1108,6 +1127,40 @@ export class Paginator extends HTMLElement {
     #setTouchStateIdle() {
         this.dataset.touchState = TOUCH_STATE_IDLE
     }
+    #currentPageScrollOffset() {
+        if (this.scrolled || !this.#container) return null
+        const offset = this.#scrollBounds?.[0]
+        if (Number.isFinite(offset)) return offset
+        const { scrollProp, size } = this
+        if (!size) return null
+        return Math.round(this.#container[scrollProp] / size) * size
+    }
+    #snapContainerToPageBoundary() {
+        const offset = this.#currentPageScrollOffset()
+        if (offset == null) return
+        const { scrollProp } = this
+        if (this.#container[scrollProp] !== offset) this.#container[scrollProp] = offset
+    }
+    #pinSelectionScroll() {
+        if (this.scrolled || !this.#container) return
+        const offset = this.#selectionScrollPin ?? this.#currentPageScrollOffset()
+        if (offset == null) return
+        this.#selectionScrollPin = offset
+        this.#enforceSelectionScrollPin()
+    }
+    #clearSelectionScrollPin() {
+        this.#selectionScrollPin = null
+    }
+    #enforceSelectionScrollPin() {
+        if (this.#selectionScrollPin == null || this.scrolled || !this.#container) return
+        if (!this.#hasActiveSelection()) {
+            this.#clearSelectionScrollPin()
+            return
+        }
+        const { scrollProp } = this
+        if (this.#container[scrollProp] !== this.#selectionScrollPin)
+            this.#container[scrollProp] = this.#selectionScrollPin
+    }
     #setTouchOwnership(owner) {
         const state = this.#touchState
         if (!state) return
@@ -1333,14 +1386,9 @@ export class Paginator extends HTMLElement {
             // Native selection auto-scroll can strand the container between
             // page boundaries while the finger drags near an edge (Merrilin
             // MER-216/MER-54: reader rested mid-page showing halves of two
-            // columns). Snap back to the nearest page whenever a selection
-            // touch sequence ends.
-            const container = this.#container
-            if (container) {
-                const { scrollProp, size } = this
-                const aligned = Math.round(container[scrollProp] / size) * size
-                if (container[scrollProp] !== aligned) container[scrollProp] = aligned
-            }
+            // columns). Snap back to the current page boundary whenever a
+            // selection touch sequence ends.
+            this.#snapContainerToPageBoundary()
             return
         }
         if (owner !== TOUCH_SWIPE) return
