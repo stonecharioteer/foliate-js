@@ -422,7 +422,14 @@ export class View extends HTMLElement {
             const [value, range, rect] = overlayer.hitTest(point)
             return isAnnotationValue(value) ? [value, range, rect] : []
         }
+        // Merrilin priority model (MER-216/MER-36): explicit links win over
+        // annotation hits. A tap on highlighted linked text follows the link;
+        // annotation actions stay reachable from the annotations list. Without
+        // this, both the link handler and show-annotation fired for the same
+        // click (stopPropagation does not stop same-node listeners).
+        const targetsLink = e => Boolean(e.target?.closest?.('a[href]'))
         const stopAnnotationPointerEvent = e => {
+            if (targetsLink(e)) return
             const [value] = getAnnotationHit(e)
             if (value) e.stopPropagation()
         }
@@ -435,6 +442,7 @@ export class View extends HTMLElement {
             'touchend',
         ]) doc.addEventListener(eventName, stopAnnotationPointerEvent, true)
         doc.addEventListener('click', e => {
+            if (targetsLink(e)) return
             const [value, range, rect] = getAnnotationHit(e)
             if (value) {
                 e.preventDefault()

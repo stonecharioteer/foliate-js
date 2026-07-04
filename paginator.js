@@ -527,6 +527,13 @@ export class Paginator extends HTMLElement {
     #touchState
     #touchHoldTimer
     #touchScrolled
+    // While a native touch selection is active, pin paginated scroll to the
+    // current page. Android Chrome drags selection handles in browser chrome,
+    // without delivering touchmove/touchend to the page, but it still
+    // auto-scrolls the overflow container near edges. Pinning prevents that
+    // browser-owned handle drag from making adjacent columns genuinely visible.
+    #selectionScrollPin
+    #selectionPinAlignRaf = null
     #lastVisibleRange
     #swipePreview
     #peekView
@@ -653,7 +660,10 @@ export class Paginator extends HTMLElement {
         // Chrome can throw during createElement if attributes are mutated here.
 
         this.#observer.observe(this.#container)
-        this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
+        this.#container.addEventListener('scroll', () => {
+            this.#enforceSelectionScrollPin()
+            this.dispatchEvent(new Event('scroll'))
+        })
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
                 if (this.#justAnchored) this.#justAnchored = false
@@ -703,12 +713,22 @@ export class Paginator extends HTMLElement {
             doc.addEventListener('keydown', () => isKeyboardSelecting = true)
             doc.addEventListener('keyup', () => isKeyboardSelecting = false)
             doc.addEventListener('selectionchange', () => {
-                this.#syncTouchSelectionOwnership()
+                const ownsTouchSelection = this.#syncTouchSelectionOwnership()
                 if (this.scrolled) return
+                const sel = doc.getSelection()
+                const hasRange = sel && !sel.isCollapsed
+                    && sel.rangeCount > 0 && sel.type === 'Range'
+                if (hasRange
+                    && (ownsTouchSelection || (!isPointerSelecting && !isKeyboardSelecting))) {
+                    // Android Chrome selection-handle drags are browser UI, not
+                    // page touch events. Keep the paginated container pinned so
+                    // handle auto-scroll cannot expose the next/previous column.
+                    this.#pinSelectionScroll()
+                }
+                else if (!hasRange) this.#clearSelectionScrollPin()
                 const range = this.#lastVisibleRange
                 if (!range) return
-                const sel = doc.getSelection()
-                if (!sel.rangeCount) return
+                if (!sel?.rangeCount) return
                 if (isPointerSelecting && sel.type === 'Range')
                     checkPointerSelection(range, sel)
                 else if (isKeyboardSelecting) {
@@ -1108,6 +1128,93 @@ export class Paginator extends HTMLElement {
     #setTouchStateIdle() {
         this.dataset.touchState = TOUCH_STATE_IDLE
     }
+    // MER-216 audit notes on the selection scroll pin:
+    // - Page offsets are fractional (size = getBoundingClientRect) while Blink
+    //   quantizes scrollLeft, so exact-equality checks never hold on Android.
+    //   An "enforcement" write triggered by the mismatch alone is a REAL
+    //   programmatic scroll; fired from the selectionchange that CREATES a
+    //   long-press selection it lands mid-anchoring and corrupts the anchor at
+    //   block boundaries (first word of a paragraph anchored at the paragraph
+    //   END). WebKit preserves fractional offsets, compared equal, stayed
+    //   clean — hence the Android-only symptom.
+    // - Therefore: never write from pin creation; compute offsets from LIVE
+    //   readback (not #scrollBounds, which goes stale when a touch cancels an
+    //   animated turn); enforce only from scroll events, skipping sub-quantum
+    //   deviations but still cancelling every real auto-scroll tick.
+    #currentPageScrollOffset() {
+        if (this.scrolled || !this.#container) return null
+        const { scrollProp, size } = this
+        if (size) return Math.round(this.#container[scrollProp] / size) * size
+        const offset = this.#scrollBounds?.[0]
+        return Number.isFinite(offset) ? offset : null
+    }
+    #snapContainerToPageBoundary() {
+        const offset = this.#currentPageScrollOffset()
+        if (offset == null) return
+        const { scrollProp } = this
+        if (Math.abs(this.#container[scrollProp] - offset) > 0.5)
+            this.#container[scrollProp] = offset
+    }
+    #pinSelectionScroll() {
+        if (this.scrolled || !this.#container) return
+        if (this.#selectionScrollPin != null) return
+        const offset = this.#currentPageScrollOffset()
+        if (offset == null) return
+        const { scrollProp } = this
+        const current = this.#container[scrollProp]
+        if (Math.abs(current - offset) <= 1.5) {
+            // Already page-aligned within scroll quantization: adopt the
+            // browser-coerced readback so future comparisons are exact, and
+            // write NOTHING during the anchoring window.
+            this.#selectionScrollPin = current
+        } else {
+            // Genuinely off-boundary (e.g. mid auto-scroll): target the page
+            // boundary; the frame loop performs the corrective write after
+            // Blink finishes anchoring this selection.
+            this.#selectionScrollPin = offset
+        }
+        this.#startSelectionPinFrameLoop()
+    }
+    // Blink's selection auto-scroll ticks run AFTER scroll-event dispatch but
+    // BEFORE paint, so a scroll-event-only revert loses every painted frame:
+    // the neighbor column flashes into view mid-drag and extraction reads it.
+    // Enforcing again in the rAF phase (after their tick, before paint) wins
+    // the frame. The loop only runs while a pin exists and writes nothing
+    // when already aligned.
+    #startSelectionPinFrameLoop() {
+        if (this.#selectionPinAlignRaf != null) return
+        const tick = () => {
+            if (this.#selectionScrollPin == null) {
+                this.#selectionPinAlignRaf = null
+                return
+            }
+            this.#enforceSelectionScrollPin()
+            this.#selectionPinAlignRaf = requestAnimationFrame(tick)
+        }
+        this.#selectionPinAlignRaf = requestAnimationFrame(tick)
+    }
+    #clearSelectionScrollPin() {
+        this.#selectionScrollPin = null
+        if (this.#selectionPinAlignRaf != null) {
+            cancelAnimationFrame(this.#selectionPinAlignRaf)
+            this.#selectionPinAlignRaf = null
+        }
+    }
+    #enforceSelectionScrollPin() {
+        if (this.#selectionScrollPin == null || this.scrolled || !this.#container) return
+        if (!this.#hasActiveSelection()) {
+            this.#clearSelectionScrollPin()
+            return
+        }
+        const { scrollProp } = this
+        if (Math.abs(this.#container[scrollProp] - this.#selectionScrollPin) <= 0.5) return
+        this.#container[scrollProp] = this.#selectionScrollPin
+        // Adopt the coerced readback when the write landed on target, so the
+        // next comparison is exact instead of perpetually off by a fraction.
+        const readback = this.#container[scrollProp]
+        if (Math.abs(readback - this.#selectionScrollPin) <= 1.5)
+            this.#selectionScrollPin = readback
+    }
     #setTouchOwnership(owner) {
         const state = this.#touchState
         if (!state) return
@@ -1115,6 +1222,10 @@ export class Paginator extends HTMLElement {
         state.owner = owner
         this.dataset.touchState = owner
         if (owner === TOUCH_SWIPE || owner === SELECTION_ACTIVE) this.#clearTouchHoldTimer()
+        // A selection-owned gesture must never keep a swipe-preview transform:
+        // residual translateX would displace the visible content relative to
+        // the selection being anchored.
+        if (owner === SELECTION_ACTIVE) this.#clearSwipePreview()
     }
     #syncTouchSelectionOwnership() {
         const state = this.#touchState
@@ -1145,6 +1256,11 @@ export class Paginator extends HTMLElement {
         if (container && !this.scrolled) {
             const { scrollProp, size } = this
             container[scrollProp] = Math.round(container[scrollProp] / size) * size
+            // Cancelled animated turns never commit #scrollBounds; refresh it
+            // here (restores 84c2ce5's invariant dropped by e5069c9) so
+            // nothing downstream pins or snaps to a stale page offset.
+            this.#scrollBounds =
+                [container[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
             const hasPrev = this.page > this.#firstContentPage
                 || this.#adjacentIndex(-1) != null
             const hasNext = this.page < this.#lastContentPage
@@ -1240,8 +1356,13 @@ export class Paginator extends HTMLElement {
 
         const selecting = this.#syncTouchSelectionOwnership()
         if (state.owner === SELECTION_ACTIVE) {
-            if (selecting) this.#maybeTurnTouchSelectionPage(touch, e.timeStamp)
-            else this.#resetTouchSelectionCornerHold()
+            // Merrilin (MER-54/MER-216): cross-page selection is disabled by
+            // product decision — selection anchors to the visible page, so the
+            // corner-hold auto page turn during selection is intentionally NOT
+            // invoked (this.#maybeTurnTouchSelectionPage). Turning mid-selection
+            // extended the selection into the next page in ways users could not
+            // see or control.
+            this.#resetTouchSelectionCornerHold()
             return
         }
         if (state.owner === SELECTION_PRIMED) {
@@ -1324,8 +1445,15 @@ export class Paginator extends HTMLElement {
         this.#touchState = null
         this.#setTouchStateIdle()
         if (this.scrolled) return
-        if (owner === SELECTION_ACTIVE) return
-        if (owner === SELECTION_PRIMED) return
+        if (owner === SELECTION_ACTIVE || owner === SELECTION_PRIMED) {
+            // Native selection auto-scroll can strand the container between
+            // page boundaries while the finger drags near an edge (Merrilin
+            // MER-216/MER-54: reader rested mid-page showing halves of two
+            // columns). Snap back to the current page boundary whenever a
+            // selection touch sequence ends.
+            this.#snapContainerToPageBoundary()
+            return
+        }
         if (owner !== TOUCH_SWIPE) return
 
         // Use requestAnimationFrame to let the browser settle viewport
