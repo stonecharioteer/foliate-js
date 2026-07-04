@@ -533,6 +533,7 @@ export class Paginator extends HTMLElement {
     // auto-scrolls the overflow container near edges. Pinning prevents that
     // browser-owned handle drag from making adjacent columns genuinely visible.
     #selectionScrollPin
+    #selectionPinAlignRaf = null
     #lastVisibleRange
     #swipePreview
     #peekView
@@ -1127,29 +1128,64 @@ export class Paginator extends HTMLElement {
     #setTouchStateIdle() {
         this.dataset.touchState = TOUCH_STATE_IDLE
     }
+    // MER-216 audit notes on the selection scroll pin:
+    // - Page offsets are fractional (size = getBoundingClientRect) while Blink
+    //   quantizes scrollLeft, so exact-equality checks never hold on Android.
+    //   An "enforcement" write triggered by the mismatch alone is a REAL
+    //   programmatic scroll; fired from the selectionchange that CREATES a
+    //   long-press selection it lands mid-anchoring and corrupts the anchor at
+    //   block boundaries (first word of a paragraph anchored at the paragraph
+    //   END). WebKit preserves fractional offsets, compared equal, stayed
+    //   clean — hence the Android-only symptom.
+    // - Therefore: never write from pin creation; compute offsets from LIVE
+    //   readback (not #scrollBounds, which goes stale when a touch cancels an
+    //   animated turn); enforce only from scroll events, skipping sub-quantum
+    //   deviations but still cancelling every real auto-scroll tick.
     #currentPageScrollOffset() {
         if (this.scrolled || !this.#container) return null
-        const offset = this.#scrollBounds?.[0]
-        if (Number.isFinite(offset)) return offset
         const { scrollProp, size } = this
-        if (!size) return null
-        return Math.round(this.#container[scrollProp] / size) * size
+        if (size) return Math.round(this.#container[scrollProp] / size) * size
+        const offset = this.#scrollBounds?.[0]
+        return Number.isFinite(offset) ? offset : null
     }
     #snapContainerToPageBoundary() {
         const offset = this.#currentPageScrollOffset()
         if (offset == null) return
         const { scrollProp } = this
-        if (this.#container[scrollProp] !== offset) this.#container[scrollProp] = offset
+        if (Math.abs(this.#container[scrollProp] - offset) > 0.5)
+            this.#container[scrollProp] = offset
     }
     #pinSelectionScroll() {
         if (this.scrolled || !this.#container) return
-        const offset = this.#selectionScrollPin ?? this.#currentPageScrollOffset()
+        if (this.#selectionScrollPin != null) return
+        const offset = this.#currentPageScrollOffset()
         if (offset == null) return
+        const { scrollProp } = this
+        const current = this.#container[scrollProp]
+        if (Math.abs(current - offset) <= 1.5) {
+            // Already page-aligned within scroll quantization: adopt the
+            // browser-coerced readback so future comparisons are exact, and
+            // write NOTHING during the anchoring window.
+            this.#selectionScrollPin = current
+            return
+        }
+        // Genuinely off-boundary (e.g. mid auto-scroll): target the page
+        // boundary but defer the corrective write until after Blink finishes
+        // anchoring this selection.
         this.#selectionScrollPin = offset
-        this.#enforceSelectionScrollPin()
+        if (this.#selectionPinAlignRaf == null) {
+            this.#selectionPinAlignRaf = requestAnimationFrame(() => {
+                this.#selectionPinAlignRaf = null
+                this.#enforceSelectionScrollPin()
+            })
+        }
     }
     #clearSelectionScrollPin() {
         this.#selectionScrollPin = null
+        if (this.#selectionPinAlignRaf != null) {
+            cancelAnimationFrame(this.#selectionPinAlignRaf)
+            this.#selectionPinAlignRaf = null
+        }
     }
     #enforceSelectionScrollPin() {
         if (this.#selectionScrollPin == null || this.scrolled || !this.#container) return
@@ -1158,8 +1194,13 @@ export class Paginator extends HTMLElement {
             return
         }
         const { scrollProp } = this
-        if (this.#container[scrollProp] !== this.#selectionScrollPin)
-            this.#container[scrollProp] = this.#selectionScrollPin
+        if (Math.abs(this.#container[scrollProp] - this.#selectionScrollPin) <= 0.5) return
+        this.#container[scrollProp] = this.#selectionScrollPin
+        // Adopt the coerced readback when the write landed on target, so the
+        // next comparison is exact instead of perpetually off by a fraction.
+        const readback = this.#container[scrollProp]
+        if (Math.abs(readback - this.#selectionScrollPin) <= 1.5)
+            this.#selectionScrollPin = readback
     }
     #setTouchOwnership(owner) {
         const state = this.#touchState
@@ -1168,6 +1209,10 @@ export class Paginator extends HTMLElement {
         state.owner = owner
         this.dataset.touchState = owner
         if (owner === TOUCH_SWIPE || owner === SELECTION_ACTIVE) this.#clearTouchHoldTimer()
+        // A selection-owned gesture must never keep a swipe-preview transform:
+        // residual translateX would displace the visible content relative to
+        // the selection being anchored.
+        if (owner === SELECTION_ACTIVE) this.#clearSwipePreview()
     }
     #syncTouchSelectionOwnership() {
         const state = this.#touchState
@@ -1198,6 +1243,11 @@ export class Paginator extends HTMLElement {
         if (container && !this.scrolled) {
             const { scrollProp, size } = this
             container[scrollProp] = Math.round(container[scrollProp] / size) * size
+            // Cancelled animated turns never commit #scrollBounds; refresh it
+            // here (restores 84c2ce5's invariant dropped by e5069c9) so
+            // nothing downstream pins or snaps to a stale page offset.
+            this.#scrollBounds =
+                [container[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
             const hasPrev = this.page > this.#firstContentPage
                 || this.#adjacentIndex(-1) != null
             const hasNext = this.page < this.#lastContentPage
