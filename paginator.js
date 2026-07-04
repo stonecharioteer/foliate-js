@@ -1167,18 +1167,31 @@ export class Paginator extends HTMLElement {
             // browser-coerced readback so future comparisons are exact, and
             // write NOTHING during the anchoring window.
             this.#selectionScrollPin = current
-            return
+        } else {
+            // Genuinely off-boundary (e.g. mid auto-scroll): target the page
+            // boundary; the frame loop performs the corrective write after
+            // Blink finishes anchoring this selection.
+            this.#selectionScrollPin = offset
         }
-        // Genuinely off-boundary (e.g. mid auto-scroll): target the page
-        // boundary but defer the corrective write until after Blink finishes
-        // anchoring this selection.
-        this.#selectionScrollPin = offset
-        if (this.#selectionPinAlignRaf == null) {
-            this.#selectionPinAlignRaf = requestAnimationFrame(() => {
+        this.#startSelectionPinFrameLoop()
+    }
+    // Blink's selection auto-scroll ticks run AFTER scroll-event dispatch but
+    // BEFORE paint, so a scroll-event-only revert loses every painted frame:
+    // the neighbor column flashes into view mid-drag and extraction reads it.
+    // Enforcing again in the rAF phase (after their tick, before paint) wins
+    // the frame. The loop only runs while a pin exists and writes nothing
+    // when already aligned.
+    #startSelectionPinFrameLoop() {
+        if (this.#selectionPinAlignRaf != null) return
+        const tick = () => {
+            if (this.#selectionScrollPin == null) {
                 this.#selectionPinAlignRaf = null
-                this.#enforceSelectionScrollPin()
-            })
+                return
+            }
+            this.#enforceSelectionScrollPin()
+            this.#selectionPinAlignRaf = requestAnimationFrame(tick)
         }
+        this.#selectionPinAlignRaf = requestAnimationFrame(tick)
     }
     #clearSelectionScrollPin() {
         this.#selectionScrollPin = null
