@@ -538,6 +538,19 @@ export class Paginator extends HTMLElement {
     #swipePreview
     #peekView
     #peekLoadToken = 0
+    // ── Page-peel (MER-171 v2) ────────────────────────────────────────────
+    // When a curl delegate is installed, this paginator is in curl mode: its
+    // own slide animation and swipe preview stay out of the way, touch drags
+    // are forwarded to the delegate, and the owned peel engine drives turns.
+    #curlDelegate = null
+    // Warm clone of the current page ({ page, front, back }) built on idle so
+    // a peel can start within a frame; ownership passes to the delegate's
+    // provider on preparePeel().
+    #peelWarm = null
+    #peelWarmScheduled = false
+    // { dir, homePage } while a peel is prepared (live doc silently
+    // translated to the adjacent page) until commitPeel()/cancelPeel().
+    #peelState = null
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -992,6 +1005,7 @@ export class Paginator extends HTMLElement {
         // Skip re-anchoring during a page turn — the turn is actively setting
         // a new scroll position and re-anchoring would revert it.
         if (!this.#locked) this.#scrollToAnchor(this.#anchor)
+        this.#invalidatePeelWarm()
     }
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
@@ -1029,45 +1043,151 @@ export class Paginator extends HTMLElement {
     get #firstContentPage() { return 1 }
     get #lastContentPage() { return this.pages - 2 }
     get #contentPageCount() { return Math.max(0, this.pages - 2) }
-    // ── Page-curl capture (MER-171) ───────────────────────────────────────
-    // Returns reparent-safe DOM surfaces for the current page and the adjacent
-    // page in `direction` WITHOUT committing navigation, for the owned curl
-    // animation. Same-section turns only (returns null at section edges so the
-    // caller can commit without animation). Clones the already-laid-out live
-    // document into a shadow root and translates to the target column, so it is
-    // safe to reparent (unlike an iframe) and needs no async reload.
-    capturePages(direction) {
+    // ── Page-peel API (MER-171 v2) ────────────────────────────────────────
+    // The owned peel engine (packages/ui pageCurl) drives turns through these
+    // methods. Intra-section turns reveal the silently translated live
+    // document; section-boundary turns reveal the preloaded peek view of the
+    // adjacent section, which #positionPeekView places at exactly the padding
+    // page offset the same translate reaches. When neither is ready,
+    // canTurnPage() is false and the caller falls back to plain navigation.
+    setCurlDelegate(delegate) {
+        this.#curlDelegate = delegate ?? null
+        if (!delegate) {
+            this.#peelState = null
+            this.#peelWarm = null
+            return
+        }
+        this.#schedulePeelWarm()
+    }
+    // The loaded peek view for a boundary turn in `direction`, or null when
+    // the peel cannot reveal it live (peek missing, still loading, built for
+    // the other edge, or the reader is not on the section edge it covers).
+    #peekReadyFor(direction) {
+        const dirSign = direction === 'next' ? 1 : -1
+        const peek = this.#peekView
+        if (!peek || peek.direction !== dirSign) return null
+        if (!peek.view?.document?.body) return null
+        if (this.#adjacentIndex(dirSign) !== peek.index) return null
+        if (dirSign > 0 && this.page < this.#lastContentPage) return null
+        if (dirSign < 0 && this.page > this.#firstContentPage) return null
+        return peek
+    }
+    canTurnPage(direction) {
+        if (this.scrolled || !this.#view?.document) return false
+        const first = 1, last = this.pages - 2
+        if (direction === 'next' ? this.page < last : this.page > first) return true
+        return this.#peekReadyFor(direction) != null
+    }
+    // Translate the laid-out document to a page WITHOUT firing relocate — in
+    // paginated mode only #scrollTo runs the bookkeeping, so a raw offset
+    // assignment is silent by construction. Used for the live peel reveal.
+    #peelTranslateTo(page) {
+        const offset = this.size * (this.#rtl ? -page : page)
+        this.#container[this.scrollProp] = offset
+    }
+    // Prepare a peel: hand over the warm front/back clones of the current
+    // page and silently reveal the adjacent page underneath. Returns null
+    // when the peel cannot run live (no warm clone yet, section edge,
+    // scrolled flow) so the engine falls back to a direct commit.
+    preparePeel(direction) {
         try {
-            if (this.scrolled || !this.#view?.document) return null
-            const doc = this.#view.document
+            if (!this.#curlDelegate || this.scrolled || !this.#view?.document) return null
+            if (this.#locked) return null
+            if (!this.canTurnPage(direction)) return null
+            const warm = this.#peelWarm
+            if (!warm || warm.page !== this.page) return null
+            // Relayouts that skip relocate (resize, setStyles, flow changes)
+            // are hooked, but late reflows can slip through — verify the
+            // captured geometry still matches before trusting the clones.
             const rect = this.#container.getBoundingClientRect()
-            const pageW = rect.width, pageH = rect.height
-            const size = this.size
-            const pages = this.pages
-            const page = this.page
-            const first = 1, last = pages - 2
-            const dir = direction === 'next' ? 1 : -1
-            let incomingPage
-            if (dir > 0) {
-                if (page < last) incomingPage = page + 1
-                else return null
-            } else {
-                if (page > first) incomingPage = page - 1
-                else return null
+            if (warm.pageW !== rect.width || warm.pageH !== rect.height
+                || warm.size !== this.size || warm.pages !== this.pages) {
+                this.#invalidatePeelWarm()
+                return null
             }
-            const current = this.#cloneDocPage(doc, page, { pageW, pageH, size, pages })
-            const incoming = this.#cloneDocPage(doc, incomingPage, { pageW, pageH, size, pages })
-            if (!current || !incoming) return null
-            return { current, incoming, width: pageW, height: pageH }
+            // Boundary turns translate onto the padding page, where the peek
+            // view's adjacent-section content sits; intra-section turns onto
+            // the neighbouring column. Same formula either way.
+            const boundary = direction === 'next'
+                ? this.page >= this.#lastContentPage
+                : this.page <= this.#firstContentPage
+            if (boundary && !this.#peekReadyFor(direction)) return null
+            const target = direction === 'next' ? this.page + 1 : this.page - 1
+            this.#peelState = { dir: direction, homePage: this.page, boundary }
+            this.#peelWarm = null
+            this.#peelTranslateTo(target)
+            return { front: warm.front, back: warm.back, width: rect.width, height: rect.height }
         } catch {
             return null
         }
+    }
+    // Commit a prepared peel: the live document already shows the target
+    // page, so this only runs the standard post-turn bookkeeping (relocate,
+    // anchor, peek sync). Boundary commits load the adjacent section via
+    // #goTo directly — next()/prev() would first scroll from the translated
+    // padding page, visibly sliding into the peek — while the peek element
+    // keeps showing the identical target content until the section settles.
+    // Without a prepared peel it is a plain page turn.
+    async commitPeel(direction) {
+        const state = this.#peelState
+        this.#peelState = null
+        if (!state) return direction === 'next' ? this.next() : this.prev()
+        if (state.boundary) {
+            const dirSign = direction === 'next' ? 1 : -1
+            const index = this.#adjacentIndex(dirSign)
+            if (index == null) return
+            await this.#goTo({ index, anchor: dirSign > 0 ? () => 0 : () => 1 })
+            this.#schedulePeelWarm()
+            return
+        }
+        const offset = this.size * (this.#rtl ? -this.page : this.page)
+        this.#scrollBounds = [offset, this.atStart ? 0 : this.size, this.atEnd ? 0 : this.size]
+        this.#afterScroll('page')
+        this.#schedulePeelWarm()
+    }
+    // Cancel a prepared peel: silently translate back to the origin page.
+    cancelPeel() {
+        const state = this.#peelState
+        this.#peelState = null
+        if (!state) return
+        this.#peelTranslateTo(state.homePage)
+        this.#schedulePeelWarm()
+    }
+    // Build the warm current-page clones on idle; best-effort — a peel that
+    // finds no warm clone falls back to direct navigation for that turn.
+    #schedulePeelWarm() {
+        if (!this.#curlDelegate || this.scrolled || this.#peelWarmScheduled) return
+        this.#peelWarmScheduled = true
+        const build = () => {
+            this.#peelWarmScheduled = false
+            try {
+                if (!this.#curlDelegate || this.scrolled || !this.#view?.document) return
+                const doc = this.#view.document
+                const rect = this.#container.getBoundingClientRect()
+                const opts = {
+                    pageW: rect.width, pageH: rect.height,
+                    size: this.size, pages: this.pages,
+                }
+                const front = this.#cloneDocPage(doc, this.page, opts)
+                const back = this.#cloneDocPage(doc, this.page, opts)
+                if (front && back) this.#peelWarm = { page: this.page, front, back, ...opts }
+            } catch { /* warm clone build is best-effort */ }
+        }
+        if (typeof requestIdleCallback === 'function') requestIdleCallback(build, { timeout: 800 })
+        else setTimeout(build, 60)
+    }
+    // Font, theme, viewport, and flow changes reflow the columns without
+    // firing relocate; a clone captured under the old layout must never peel.
+    #invalidatePeelWarm() {
+        if (!this.#curlDelegate) return
+        this.#peelWarm = null
+        this.#schedulePeelWarm()
     }
     #cloneDocPage(doc, page, { pageW, pageH, size, pages }) {
         const wrapper = document.createElement('div')
         Object.assign(wrapper.style, {
             position: 'absolute', width: `${pageW}px`, height: `${pageH}px`,
-            // Fall back to transparent (not white) so the curl engine's themed
+            // Fall back to transparent (not white) so the peel engine's themed
             // backdrop shows through on dark/sepia rather than flashing white.
             overflow: 'hidden', background: getBackground(doc) || 'transparent',
         })
@@ -1334,7 +1454,7 @@ export class Paginator extends HTMLElement {
         }
         this.#cancelRunningAnimation(true)
         const container = this.#container
-        if (container && !this.scrolled) {
+        if (container && !this.scrolled && !this.#curlDelegate) {
             const { scrollProp, size } = this
             container[scrollProp] = Math.round(container[scrollProp] / size) * size
             // Cancelled animated turns never commit #scrollBounds; refresh it
@@ -1358,6 +1478,11 @@ export class Paginator extends HTMLElement {
         this.#touchState = {
             x: touch?.screenX, y: touch?.screenY,
             startX: touch?.screenX, startY: touch?.screenY,
+            // Curl mode (MER-171 v2): container-local mapping needs client
+            // coords, and drags starting on interactive content never peel.
+            startClientX: touch?.clientX, startClientY: touch?.clientY,
+            curlBlocked: !!e.target?.closest?.(
+                'a, button, input, textarea, select, [contenteditable]'),
             t: e.timeStamp,
             startTime: e.timeStamp,
             vx: 0, vy: 0,
@@ -1486,6 +1611,15 @@ export class Paginator extends HTMLElement {
         state.vx = dx / dt
         state.vy = dy / dt
         this.#touchScrolled = true
+        if (this.#curlDelegate) {
+            if (!state.curlBlocked) this.#curlDelegate.onCurlDragMove?.({
+                startClientX: state.startClientX,
+                startClientY: state.startClientY,
+                clientX: touch.clientX,
+                clientY: touch.clientY,
+            })
+            return
+        }
         const preview = this.#swipePreview
         if (!preview) return
         const delta = this.#vertical ? dy : dx
@@ -1541,6 +1675,10 @@ export class Paginator extends HTMLElement {
         // scale after pinch gestures before deciding on navigation.
         requestAnimationFrame(() => {
             if (getViewportScale() !== 1) return
+            if (this.#curlDelegate) {
+                if (!state.curlBlocked) this.#curlDelegate.onCurlDragEnd?.()
+                return
+            }
 
             const displacement = this.#swipePreview?.displacement ?? 0
             const absDisplacement = Math.abs(displacement)
@@ -1596,7 +1734,7 @@ export class Paginator extends HTMLElement {
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
         const animateScroll = (reason === 'snap' || smooth)
-            && this.hasAttribute('animated')
+            && !this.#curlDelegate && this.hasAttribute('animated')
         if (animateScroll) {
             // Cancel any in-flight animation before starting a new one
             if (this._animationSignal) this._animationSignal.cancelled = true
@@ -1694,6 +1832,11 @@ export class Paginator extends HTMLElement {
         }
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
         this.#syncPeekView()
+        // The settled page becomes the next peel's warm current-page clone.
+        if (this.#curlDelegate) {
+            this.#peelWarm = null
+            this.#schedulePeelWarm()
+        }
     }
     async #display(promise) {
         const { index, src, anchor, onLoad, select } = await promise
@@ -1865,6 +2008,7 @@ export class Paginator extends HTMLElement {
             currentPeek.view.expand()
             this.#positionPeekView()
         })
+        this.#invalidatePeelWarm()
     }
     focusView() {
         this.#view?.document?.defaultView?.focus()
