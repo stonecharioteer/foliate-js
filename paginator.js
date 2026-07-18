@@ -1475,12 +1475,17 @@ export class Paginator extends HTMLElement {
         }
         this.#clearTouchHoldTimer()
         const touch = e.changedTouches[0]
+        const rootStart = touch ? this.#touchRootClient(e, touch) : { x: null, y: null }
         this.#touchState = {
             x: touch?.screenX, y: touch?.screenY,
             startX: touch?.screenX, startY: touch?.screenY,
-            // Curl mode (MER-171 v2): container-local mapping needs client
-            // coords, and drags starting on interactive content never peel.
-            startClientX: touch?.clientX, startClientY: touch?.clientY,
+            // Curl mode (MER-171 v2): the peel engine maps these against the
+            // host's rect in the TOP document, but reading-surface touches
+            // fire inside the section iframe whose client space is offset by
+            // the container scroll (whole page-widths on later pages).
+            // Convert to top-document client coords; drags starting on
+            // interactive content never peel.
+            startClientX: rootStart.x, startClientY: rootStart.y,
             curlBlocked: !!e.target?.closest?.(
                 'a, button, input, textarea, select, [contenteditable]'),
             t: e.timeStamp,
@@ -1498,6 +1503,17 @@ export class Paginator extends HTMLElement {
             if (!state || state.owner !== TOUCH_PENDING) return
             this.#setTouchOwnership(SELECTION_PRIMED)
         }, TOUCH_SELECTION_HOLD_MS)
+    }
+    // Convert a touch's client coords to the TOP document's client space.
+    // Events from the section iframe carry iframe-local coords; the iframe is
+    // as wide as every laid-out column and slides under the finger when the
+    // container scrolls (including the peel's silent translate), so a fresh
+    // frame rect per event is the only stable mapping.
+    #touchRootClient(e, touch) {
+        const frame = (e.view ?? e.target?.ownerDocument?.defaultView)?.frameElement
+        if (!frame) return { x: touch.clientX, y: touch.clientY }
+        const rect = frame.getBoundingClientRect()
+        return { x: touch.clientX + rect.left, y: touch.clientY + rect.top }
     }
     #resetTouchSelectionCornerHold() {
         if (!this.#touchState) return
@@ -1612,12 +1628,15 @@ export class Paginator extends HTMLElement {
         state.vy = dy / dt
         this.#touchScrolled = true
         if (this.#curlDelegate) {
-            if (!state.curlBlocked) this.#curlDelegate.onCurlDragMove?.({
-                startClientX: state.startClientX,
-                startClientY: state.startClientY,
-                clientX: touch.clientX,
-                clientY: touch.clientY,
-            })
+            if (!state.curlBlocked) {
+                const root = this.#touchRootClient(e, touch)
+                this.#curlDelegate.onCurlDragMove?.({
+                    startClientX: state.startClientX,
+                    startClientY: state.startClientY,
+                    clientX: root.x,
+                    clientY: root.y,
+                })
+            }
             return
         }
         const preview = this.#swipePreview
