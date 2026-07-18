@@ -551,6 +551,8 @@ export class Paginator extends HTMLElement {
     // { dir, homePage } while a peel is prepared (live doc silently
     // translated to the adjacent page) until commitPeel()/cancelPeel().
     #peelState = null
+    // Columns per viewport from the last layout (1 or 2); the peel turns one.
+    #pageColumns = 1
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -859,11 +861,15 @@ export class Paginator extends HTMLElement {
                 this.#footer.replaceChildren()
             }
             const columnWidth = maxInlineSize
+            this.#pageColumns = 1
             return { flow, margin, marginTop, marginBottom, marginLeft, marginRight, gap, columnWidth }
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
         const columnWidth = (size / divisor) - gap
+        // Visible columns per viewport — the peel engine turns one column
+        // (one physical page of the spread), not the whole viewport.
+        this.#pageColumns = divisor
         if (updateChrome) this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
 
         if (updateChrome) {
@@ -1077,6 +1083,23 @@ export class Paginator extends HTMLElement {
         const first = 1, last = this.pages - 2
         if (direction === 'next' ? this.page < last : this.page > first) return true
         return this.#peekReadyFor(direction) != null
+    }
+    // Visible columns in the current layout (1 or 2). The peel engine sizes
+    // its turning sheet to one column so spreads turn a single page.
+    get pageColumns() {
+        return this.#pageColumns
+    }
+    // The section document's real page color. The peel engine paints its
+    // opaque paper layers with this so the turning sheet matches the page it
+    // covers exactly — the host element's computed background can differ by a
+    // theme tint from what the iframe actually renders.
+    get contentBackground() {
+        try {
+            const doc = this.#view?.document
+            return doc ? (getSafeBackground(doc) || null) : null
+        } catch {
+            return null
+        }
     }
     // Translate the laid-out document to a page WITHOUT firing relocate — in
     // paginated mode only #scrollTo runs the bookkeeping, so a raw offset
