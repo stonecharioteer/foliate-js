@@ -1136,10 +1136,21 @@ export class Paginator extends HTMLElement {
                 : this.page <= this.#firstContentPage
             if (boundary && !this.#peekReadyFor(direction)) return null
             const target = direction === 'next' ? this.page + 1 : this.page - 1
+            // Spread turns flip a real leaf: its back is the target viewport's
+            // incoming column (pre-mirrored clone). Boundary turns and missing
+            // clones keep the single-page convention — the current page
+            // mirrored behind a paper wash.
+            const spreadBack = direction === 'next' ? warm.nextBack : warm.prevBack
+            const useSpreadBack = !boundary && spreadBack != null
             this.#peelState = { dir: direction, homePage: this.page, boundary }
             this.#peelWarm = null
             this.#peelTranslateTo(target)
-            return { front: warm.front, back: warm.back, width: rect.width, height: rect.height }
+            return {
+                front: warm.front,
+                back: useSpreadBack ? spreadBack : warm.back,
+                width: rect.width, height: rect.height,
+                backFace: useSpreadBack ? 'content' : 'mirror',
+            }
         } catch {
             return null
         }
@@ -1178,6 +1189,11 @@ export class Paginator extends HTMLElement {
     }
     // Build the warm current-page clones on idle; best-effort — a peel that
     // finds no warm clone falls back to direct navigation for that turn.
+    // Two-column spreads additionally warm direction-aware BACK clones of the
+    // adjacent viewports: the turning leaf's paper back is the incoming left
+    // column on a next-turn (and the incoming right column going back), so the
+    // landed flap matches the live content underneath and the overlay retire
+    // is seamless instead of snapping the stationary leaf.
     #schedulePeelWarm() {
         if (!this.#curlDelegate || this.scrolled || this.#peelWarmScheduled) return
         this.#peelWarmScheduled = true
@@ -1193,7 +1209,15 @@ export class Paginator extends HTMLElement {
                 }
                 const front = this.#cloneDocPage(doc, this.page, opts)
                 const back = this.#cloneDocPage(doc, this.page, opts)
-                if (front && back) this.#peelWarm = { page: this.page, front, back, ...opts }
+                let nextBack = null, prevBack = null
+                if (this.#pageColumns === 2 && !this.#vertical) {
+                    if (this.page < this.#lastContentPage)
+                        nextBack = this.#cloneDocPageMirrored(doc, this.page + 1, opts)
+                    if (this.page > this.#firstContentPage)
+                        prevBack = this.#cloneDocPageMirrored(doc, this.page - 1, opts)
+                }
+                if (front && back)
+                    this.#peelWarm = { page: this.page, front, back, nextBack, prevBack, ...opts }
             } catch { /* warm clone build is best-effort */ }
         }
         if (typeof requestIdleCallback === 'function') requestIdleCallback(build, { timeout: 800 })
@@ -1251,6 +1275,18 @@ export class Paginator extends HTMLElement {
         root.appendChild(bodyClone)
         positioner.appendChild(root)
         shadow.appendChild(positioner)
+        return wrapper
+    }
+    // A page clone pre-mirrored about the wrapper's vertical center — the
+    // spine plane in a two-column spread. The peel engine renders the flap
+    // back through a reflection matrix (determinant −1); composing it with
+    // this mirror yields a rigid motion, so the back face reads un-mirrored
+    // at every peel angle — real paper — and at landing the flap shows the
+    // target column exactly where the live document renders it.
+    #cloneDocPageMirrored(doc, page, opts) {
+        const wrapper = this.#cloneDocPage(doc, page, opts)
+        if (!wrapper) return null
+        wrapper.style.transform = 'scaleX(-1)'
         return wrapper
     }
     #isPageAnchor(anchor) {
