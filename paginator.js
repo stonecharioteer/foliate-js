@@ -1117,17 +1117,24 @@ export class Paginator extends HTMLElement {
             if (!this.#curlDelegate || this.scrolled || !this.#view?.document) return null
             if (this.#locked) return null
             if (!this.canTurnPage(direction)) return null
-            const warm = this.#peelWarm
-            if (!warm || warm.page !== this.page) return null
+            const rect = this.#container.getBoundingClientRect()
+            let warm = this.#peelWarm
             // Relayouts that skip relocate (resize, setStyles, flow changes)
             // are hooked, but late reflows can slip through — verify the
             // captured geometry still matches before trusting the clones.
-            const rect = this.#container.getBoundingClientRect()
-            if (warm.pageW !== rect.width || warm.pageH !== rect.height
-                || warm.size !== this.size || warm.pages !== this.pages) {
-                this.#invalidatePeelWarm()
-                return null
+            if (warm && (warm.page !== this.page
+                || warm.pageW !== rect.width || warm.pageH !== rect.height
+                || warm.size !== this.size || warm.pages !== this.pages)) {
+                warm = null
             }
+            // Cold turn (idle warm build hasn't landed yet — e.g. the very
+            // first tap after opening): build the clones on demand. A few ms
+            // of clone work on an explicit turn beats silently skipping the
+            // animation, which reads as "the page just changed, then a later
+            // tap animated" — the fallback to null (direct nav) remains for
+            // genuine failures.
+            if (!warm) warm = this.#buildPeelWarm()
+            if (!warm) return null
             // Boundary turns translate onto the padding page, where the peek
             // view's adjacent-section content sits; intra-section turns onto
             // the neighbouring column. Same formula either way.
@@ -1194,31 +1201,42 @@ export class Paginator extends HTMLElement {
     // column on a next-turn (and the incoming right column going back), so the
     // landed flap matches the live content underneath and the overlay retire
     // is seamless instead of snapping the stationary leaf.
+    // Build (and cache) the warm clone set for the current page. Shared by
+    // the idle prefetch and the on-demand cold-turn path in preparePeel.
+    // Returns the warm entry or null; never throws.
+    #buildPeelWarm() {
+        try {
+            if (!this.#curlDelegate || this.scrolled || !this.#view?.document) return null
+            const doc = this.#view.document
+            const rect = this.#container.getBoundingClientRect()
+            const opts = {
+                pageW: rect.width, pageH: rect.height,
+                size: this.size, pages: this.pages,
+            }
+            const front = this.#cloneDocPage(doc, this.page, opts)
+            const back = this.#cloneDocPage(doc, this.page, opts)
+            let nextBack = null, prevBack = null
+            if (this.#pageColumns === 2 && !this.#vertical) {
+                if (this.page < this.#lastContentPage)
+                    nextBack = this.#cloneDocPageMirrored(doc, this.page + 1, opts)
+                if (this.page > this.#firstContentPage)
+                    prevBack = this.#cloneDocPageMirrored(doc, this.page - 1, opts)
+            }
+            if (!front || !back) return null
+            const warm = { page: this.page, front, back, nextBack, prevBack, ...opts }
+            this.#peelWarm = warm
+            return warm
+        } catch {
+            /* warm clone build is best-effort */
+            return null
+        }
+    }
     #schedulePeelWarm() {
         if (!this.#curlDelegate || this.scrolled || this.#peelWarmScheduled) return
         this.#peelWarmScheduled = true
         const build = () => {
             this.#peelWarmScheduled = false
-            try {
-                if (!this.#curlDelegate || this.scrolled || !this.#view?.document) return
-                const doc = this.#view.document
-                const rect = this.#container.getBoundingClientRect()
-                const opts = {
-                    pageW: rect.width, pageH: rect.height,
-                    size: this.size, pages: this.pages,
-                }
-                const front = this.#cloneDocPage(doc, this.page, opts)
-                const back = this.#cloneDocPage(doc, this.page, opts)
-                let nextBack = null, prevBack = null
-                if (this.#pageColumns === 2 && !this.#vertical) {
-                    if (this.page < this.#lastContentPage)
-                        nextBack = this.#cloneDocPageMirrored(doc, this.page + 1, opts)
-                    if (this.page > this.#firstContentPage)
-                        prevBack = this.#cloneDocPageMirrored(doc, this.page - 1, opts)
-                }
-                if (front && back)
-                    this.#peelWarm = { page: this.page, front, back, nextBack, prevBack, ...opts }
-            } catch { /* warm clone build is best-effort */ }
+            this.#buildPeelWarm()
         }
         if (typeof requestIdleCallback === 'function') requestIdleCallback(build, { timeout: 800 })
         else setTimeout(build, 60)
