@@ -1865,6 +1865,16 @@ export class Paginator extends HTMLElement {
     async #scrollToAnchor(anchor, reason = 'anchor') {
         this.#anchor = anchor
         if (!this.scrolled && this.#isPageAnchor(anchor)) {
+            // A page-number anchor is only meaningful inside the pagination
+            // grid it was recorded in. After a reflow that changes the page
+            // count (font size, styles, margins, resize), the same page index
+            // holds different text — degrade to the last visible DOM range,
+            // which survives reflow, so the reader stays on the same words.
+            if (anchor.pageCount != null && anchor.pageCount !== this.#contentPageCount
+                && this.#lastVisibleRange) {
+                await this.#scrollToAnchor(this.#lastVisibleRange, reason)
+                return
+            }
             const page = Math.max(this.#firstContentPage, Math.min(this.#lastContentPage, anchor.page))
             await this.#scrollToPage(page, reason)
             return
@@ -1908,7 +1918,10 @@ export class Paginator extends HTMLElement {
             // page they landed on. Range anchors can drift when headings or
             // other block elements bleed across column boundaries.
             if (reason === 'page' && !this.scrolled) {
-                this.#anchor = { type: 'page', page: this.page }
+                // pageCount pins the anchor to this pagination grid; a later
+                // reflow that changes the count invalidates the page number
+                // and #scrollToAnchor falls back to the visible range.
+                this.#anchor = { type: 'page', page: this.page, pageCount: this.#contentPageCount }
             } else {
                 this.#anchor = range
             }
