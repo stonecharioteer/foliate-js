@@ -359,7 +359,11 @@ class View {
     }
     render(layout) {
         if (!layout) return
-        if (!this.document) return
+        const doc = this.document
+        // Font promises and resize observers can settle after a presentation
+        // toggle destroys this iframe. Its contentDocument may still exist
+        // briefly without a root/body; stale layout work must no-op.
+        if (!doc?.documentElement || !doc.body) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         if (this.#column) this.columnize(layout)
@@ -436,8 +440,9 @@ class View {
         }
     }
     expand() {
-        if (!this.document) return
-        const { documentElement } = this.document
+        const doc = this.document
+        if (!doc?.documentElement || !doc.body) return
+        const { documentElement } = doc
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
             const otherSide = this.#vertical ? 'width' : 'height'
@@ -493,7 +498,8 @@ class View {
         return this.#overlayer
     }
     destroy() {
-        if (this.document) this.#observer.unobserve(this.document.body)
+        const body = this.document?.body
+        if (body) this.#observer.unobserve(body)
     }
 }
 
