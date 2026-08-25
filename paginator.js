@@ -359,7 +359,11 @@ class View {
     }
     render(layout) {
         if (!layout) return
-        if (!this.document) return
+        const doc = this.document
+        // Font promises and resize observers can settle after a presentation
+        // toggle destroys this iframe. Its contentDocument may still exist
+        // briefly without a root/body; stale layout work must no-op.
+        if (!doc?.documentElement || !doc.body) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         if (this.#column) this.columnize(layout)
@@ -436,8 +440,9 @@ class View {
         }
     }
     expand() {
-        if (!this.document) return
-        const { documentElement } = this.document
+        const doc = this.document
+        if (!doc?.documentElement || !doc.body) return
+        const { documentElement } = doc
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
             const otherSide = this.#vertical ? 'width' : 'height'
@@ -493,7 +498,8 @@ class View {
         return this.#overlayer
     }
     destroy() {
-        if (this.document) this.#observer.unobserve(this.document.body)
+        const body = this.document?.body
+        if (body) this.#observer.unobserve(body)
     }
 }
 
@@ -940,6 +946,13 @@ export class Paginator extends HTMLElement {
                     this.#styleMap.set(doc, [$styleBefore, $style])
                     this.#applyStylesToDoc(doc)
                 }
+                // Peek documents are visual-only curl clones. Give the host a
+                // dedicated preparation hook without firing the main `load`
+                // contract, which would attach selection/tap handlers and
+                // report the clone as active reader content.
+                this.dispatchEvent(new CustomEvent('peek-load', {
+                    detail: { doc, index },
+                }))
             }, ({ vertical, rtl }) => this.#computeLayout(vertical, rtl))
         } catch {
             peek.destroy()
@@ -1531,7 +1544,7 @@ export class Paginator extends HTMLElement {
         }
         this.#cancelRunningAnimation(true)
         const container = this.#container
-        if (container && !this.scrolled && !this.#curlDelegate) {
+        if (container && !this.scrolled && !this.#curlDelegate && this.hasAttribute('animated')) {
             const { scrollProp, size } = this
             container[scrollProp] = Math.round(container[scrollProp] / size) * size
             // Cancelled animated turns never commit #scrollBounds; refresh it
@@ -1865,6 +1878,16 @@ export class Paginator extends HTMLElement {
     async #scrollToAnchor(anchor, reason = 'anchor') {
         this.#anchor = anchor
         if (!this.scrolled && this.#isPageAnchor(anchor)) {
+            // A page-number anchor is only meaningful inside the pagination
+            // grid it was recorded in. After a reflow that changes the page
+            // count (font size, styles, margins, resize), the same page index
+            // holds different text — degrade to the last visible DOM range,
+            // which survives reflow, so the reader stays on the same words.
+            if (anchor.pageCount != null && anchor.pageCount !== this.#contentPageCount
+                && this.#lastVisibleRange) {
+                await this.#scrollToAnchor(this.#lastVisibleRange, reason)
+                return
+            }
             const page = Math.max(this.#firstContentPage, Math.min(this.#lastContentPage, anchor.page))
             await this.#scrollToPage(page, reason)
             return
@@ -1908,7 +1931,10 @@ export class Paginator extends HTMLElement {
             // page they landed on. Range anchors can drift when headings or
             // other block elements bleed across column boundaries.
             if (reason === 'page' && !this.scrolled) {
-                this.#anchor = { type: 'page', page: this.page }
+                // pageCount pins the anchor to this pagination grid; a later
+                // reflow that changes the count invalidates the page number
+                // and #scrollToAnchor falls back to the visible range.
+                this.#anchor = { type: 'page', page: this.page, pageCount: this.#contentPageCount }
             } else {
                 this.#anchor = range
             }
@@ -2070,12 +2096,18 @@ export class Paginator extends HTMLElement {
         return this.goTo({ index })
     }
     getContents() {
-        if (this.#view) return [{
+        const contents = []
+        if (this.#view) contents.push({
             index: this.#index,
             overlayer: this.#view.overlayer,
             doc: this.#view.document,
-        }]
-        return []
+        })
+        if (this.#peekView?.view?.document) contents.push({
+            index: this.#peekView.index,
+            overlayer: this.#peekView.view.overlayer,
+            doc: this.#peekView.view.document,
+        })
+        return contents
     }
     getVisibleRange() {
         return this.#getVisibleRange()
