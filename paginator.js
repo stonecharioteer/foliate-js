@@ -940,6 +940,13 @@ export class Paginator extends HTMLElement {
                     this.#styleMap.set(doc, [$styleBefore, $style])
                     this.#applyStylesToDoc(doc)
                 }
+                // Peek documents are visual-only curl clones. Give the host a
+                // dedicated preparation hook without firing the main `load`
+                // contract, which would attach selection/tap handlers and
+                // report the clone as active reader content.
+                this.dispatchEvent(new CustomEvent('peek-load', {
+                    detail: { doc, index },
+                }))
             }, ({ vertical, rtl }) => this.#computeLayout(vertical, rtl))
         } catch {
             peek.destroy()
@@ -2083,12 +2090,18 @@ export class Paginator extends HTMLElement {
         return this.goTo({ index })
     }
     getContents() {
-        if (this.#view) return [{
+        const contents = []
+        if (this.#view) contents.push({
             index: this.#index,
             overlayer: this.#view.overlayer,
             doc: this.#view.document,
-        }]
-        return []
+        })
+        if (this.#peekView?.view?.document) contents.push({
+            index: this.#peekView.index,
+            overlayer: this.#peekView.view.overlayer,
+            doc: this.#peekView.view.document,
+        })
+        return contents
     }
     getVisibleRange() {
         return this.#getVisibleRange()
