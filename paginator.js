@@ -1531,7 +1531,7 @@ export class Paginator extends HTMLElement {
         }
         this.#cancelRunningAnimation(true)
         const container = this.#container
-        if (container && !this.scrolled && !this.#curlDelegate) {
+        if (container && !this.scrolled && !this.#curlDelegate && this.hasAttribute('animated')) {
             const { scrollProp, size } = this
             container[scrollProp] = Math.round(container[scrollProp] / size) * size
             // Cancelled animated turns never commit #scrollBounds; refresh it
