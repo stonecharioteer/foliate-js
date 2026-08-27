@@ -1544,7 +1544,7 @@ export class Paginator extends HTMLElement {
         }
         this.#cancelRunningAnimation(true)
         const container = this.#container
-        if (container && !this.scrolled && !this.#curlDelegate && this.hasAttribute('animated')) {
+        if (container && !this.scrolled && !this.#curlDelegate) {
             const { scrollProp, size } = this
             container[scrollProp] = Math.round(container[scrollProp] / size) * size
             // Cancelled animated turns never commit #scrollBounds; refresh it
@@ -1556,6 +1556,9 @@ export class Paginator extends HTMLElement {
                 || this.#adjacentIndex(-1) != null
             const hasNext = this.page < this.#lastContentPage
                 || this.#adjacentIndex(1) != null
+            // This state is also the gesture displacement accumulator. Keep it
+            // when animation is off so touchend can commit an instant turn;
+            // only the visual transform below is animation-gated.
             this.#swipePreview = {
                 homeOffset: container[scrollProp],
                 displacement: 0,
@@ -1736,7 +1739,8 @@ export class Paginator extends HTMLElement {
             preview.maxForward,
             preview.displacement + delta,
         ))
-        this.#applySwipePreviewTransform(preview.displacement)
+        if (this.hasAttribute('animated'))
+            this.#applySwipePreviewTransform(preview.displacement)
     }
     #hasActiveSelection() {
         // Check both the outer document and the iframe document for
